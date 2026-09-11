@@ -14,6 +14,7 @@ import re
 import time
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
@@ -38,6 +39,8 @@ DEFAULT_PARSER = "earley"
 DEFAULT_START_RULE = "start"
 
 ERROR_TAG = "error"
+SPAN_TAG = "span"
+SPAN_COLOUR = "#cfe3ff"
 ERROR_COLOUR = "#b00020"
 OK_COLOUR = "#1b5e20"
 HIGHLIGHT_COLOUR = "#ffd6d6"
@@ -51,8 +54,20 @@ INPUT_KIND = "input"
 
 TEXT_VIEW = "text"
 TREE_VIEW = "tree"
+CORPUS_VIEW = "corpus"
+VIEW_ORDER = (TEXT_VIEW, TREE_VIEW, CORPUS_VIEW)
 MAX_TREE_NODES = 20000
 MAX_TREE_VALUE_CHARS = 80
+
+CORPUS_SUFFIX = ".corpus.json"
+CORPUS_VERSION = 1
+CORPUS_FILETYPES = [("Corpus files", "*.json"), ("All files", "*.*")]
+EXPECT_PARSE = "parse"
+EXPECT_ERROR = "error"
+RESULT_UNKNOWN = ""
+RESULT_PASS = "pass"
+RESULT_FAIL = "fail"
+PASS_COLOUR = "#1b5e20"
 
 HIGHLIGHT_DELAY_MS = 150
 SYNTAX_COLOURS = {
@@ -144,6 +159,129 @@ class GrammarHighlighter:
             self.text.tag_add(name, start, f"1.0 + {match.end()}c")
 
 
+@dataclass
+class CorpusCase:
+    """One named sample of the language, with what it is expected to do."""
+
+    name: str
+    text: str
+    expect: str = EXPECT_PARSE
+    tree: str | None = None
+    result: str = field(default=RESULT_UNKNOWN, compare=False)
+    detail: str = field(default="", compare=False)
+
+    def to_dict(self) -> dict:
+        data = {"name": self.name, "input": self.text, "expect": self.expect}
+        if self.tree is not None:
+            data["tree"] = self.tree
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CorpusCase:
+        expect = data.get("expect", EXPECT_PARSE)
+        tree = data.get("tree")
+        return cls(
+            name=str(data.get("name", "unnamed")),
+            text=str(data.get("input", "")),
+            expect=expect if expect in (EXPECT_PARSE, EXPECT_ERROR) else EXPECT_PARSE,
+            tree=str(tree) if isinstance(tree, str) else None,
+        )
+
+
+class Corpus:
+    """A list of test inputs for one grammar, stored alongside it as JSON."""
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.cases: list[CorpusCase] = []
+        self.dirty = False
+
+    @staticmethod
+    def default_path_for(grammar_path: Path) -> Path:
+        return grammar_path.with_suffix(CORPUS_SUFFIX)
+
+    def clear(self) -> None:
+        self.path = None
+        self.cases = []
+        self.dirty = False
+
+    def load(self, path: Path) -> None:
+        """Replace the contents from a file. Raises OSError or ValueError on a bad file."""
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = payload.get("cases") if isinstance(payload, dict) else None
+        entries = list(raw) if isinstance(raw, list) else None
+        if entries is None:
+            raise ValueError("a corpus file must be a JSON object holding a 'cases' list")
+        self.cases = [CorpusCase.from_dict(case) for case in entries if isinstance(case, dict)]
+        self.path = path
+        self.dirty = False
+
+    def save(self, path: Path | None = None) -> None:
+        target = path or self.path
+        if target is None:
+            raise ValueError("no corpus path to save to")
+        payload = {"version": CORPUS_VERSION, "cases": [case.to_dict() for case in self.cases]}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self.path = target
+        self.dirty = False
+
+    def add(self, case: CorpusCase) -> None:
+        self.cases.append(case)
+        self.dirty = True
+
+    def remove(self, index: int) -> None:
+        del self.cases[index]
+        self.dirty = True
+
+    def unique_name(self, wanted: str) -> str:
+        existing = {case.name for case in self.cases}
+        if wanted not in existing:
+            return wanted
+        for suffix in range(2, len(existing) + 3):
+            candidate = f"{wanted} ({suffix})"
+            if candidate not in existing:
+                return candidate
+        return wanted
+
+
+def node_span(node: object) -> tuple[int, int, int, int] | None:
+    """The (line, column, end_line, end_column) a tree or token covers, or None when unknown."""
+    meta = getattr(node, "meta", None)
+    if meta is not None and not getattr(meta, "empty", True):
+        return meta.line, meta.column, meta.end_line, meta.end_column
+    line = getattr(node, "line", None)
+    end_line = getattr(node, "end_line", None)
+    if line is None or end_line is None:
+        return None
+    return line, node.column, end_line, node.end_column
+
+
+def run_corpus(parser: object, cases: list[CorpusCase]) -> tuple[int, int]:
+    """Run every case against a compiled parser, recording the outcome on each. Returns (passed, total)."""
+    passed = 0
+    for case in cases:
+        case.result, case.detail = _run_case(parser, case)
+        if case.result == RESULT_PASS:
+            passed += 1
+    return passed, len(cases)
+
+
+def _run_case(parser: object, case: CorpusCase) -> tuple[str, str]:
+    try:
+        tree = parser.parse(case.text)
+    except lark_exceptions.LarkError as exc:
+        first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if case.expect == EXPECT_ERROR:
+            return RESULT_PASS, first_line
+        return RESULT_FAIL, first_line
+    if case.expect == EXPECT_ERROR:
+        return RESULT_FAIL, "parsed, but an error was expected"
+    if case.tree is not None and tree.pretty().rstrip("\n") != case.tree.rstrip("\n"):
+        return RESULT_FAIL, "tree differs from the recorded one"
+    return RESULT_PASS, ""
+
+
 class EditorPane(ttk.Frame):
     """A titled, scrollable, editable text pane backed by an optional file on disk."""
 
@@ -164,8 +302,12 @@ class EditorPane(ttk.Frame):
         self.path: Path | None = None
         self.dirty = False
 
-        self.header = ttk.Label(self, anchor="w", padding=(4, 3))
-        self.header.pack(fill="x")
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        self.header = ttk.Label(header, anchor="w", padding=(4, 3))
+        self.header.pack(side="left", fill="x", expand=True)
+        self.badge = ttk.Label(header, anchor="e", padding=(4, 3))
+        self.badge.pack(side="right")
 
         self.text = ScrolledText(self, wrap="none", undo=True, font=editor_font, width=40, height=25)
         self.text.pack(fill="both", expand=True)
@@ -174,9 +316,50 @@ class EditorPane(ttk.Frame):
         hbar.pack(fill="x")
         self.text.configure(xscrollcommand=hbar.set)
         self.text.tag_configure(ERROR_TAG, background=HIGHLIGHT_COLOUR)
+        self.text.tag_configure(SPAN_TAG, background=SPAN_COLOUR)
+        self.text.tag_lower(SPAN_TAG, ERROR_TAG)
 
         self.text.bind("<<Modified>>", self._on_modified)
+        self._build_context_menu()
         self._refresh_header()
+
+    # -- context menu ----------------------------------------------------------------------------
+
+    def _build_context_menu(self) -> None:
+        """File commands first, then the usual editing commands. File entries are filled in later."""
+        self.menu = tk.Menu(self, tearoff=False)
+        self.file_command_count = 0
+        self.menu.add_command(label="Cut", command=lambda: self._edit_event("<<Cut>>"))
+        self.menu.add_command(label="Copy", command=lambda: self._edit_event("<<Copy>>"))
+        self.menu.add_command(label="Paste", command=lambda: self._edit_event("<<Paste>>"))
+        self.menu.add_separator()
+        self.menu.add_command(label="Select All", command=self.select_all)
+        self.menu.add_separator()
+        self.menu.add_command(label="Undo", command=lambda: self._edit_event("<<Undo>>"))
+        self.menu.add_command(label="Redo", command=lambda: self._edit_event("<<Redo>>"))
+        self.text.bind("<Button-3>", self._on_context_menu)
+        self.text.bind("<Button-2>", self._on_context_menu)
+
+    def set_file_commands(self, commands: list[tuple[str, Callable[[], None]]]) -> None:
+        """Insert file commands at the top of the context menu, replacing any set before."""
+        for _ in range(self.file_command_count):
+            self.menu.delete(0)
+        for index, (label, callback) in enumerate(commands):
+            self.menu.insert_command(index, label=label, command=callback)
+        self.menu.insert_separator(len(commands))
+        self.file_command_count = len(commands) + 1
+
+    def _edit_event(self, event: str) -> None:
+        self.text.event_generate(event)
+
+    def select_all(self) -> None:
+        self.text.tag_add("sel", "1.0", "end-1c")
+        self.text.focus_set()
+
+    def _on_context_menu(self, event: tk.Event) -> str:
+        self.text.focus_set()
+        self.menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     # -- content ---------------------------------------------------------------------------------
 
@@ -194,8 +377,23 @@ class EditorPane(ttk.Frame):
         self.text.edit_modified(False)
         self._refresh_header()
 
+    def set_badge(self, text: str) -> None:
+        self.badge.configure(text=text)
+
     def clear_error(self) -> None:
         self.text.tag_remove(ERROR_TAG, "1.0", "end")
+
+    def clear_span(self) -> None:
+        self.text.tag_remove(SPAN_TAG, "1.0", "end")
+
+    def highlight_span(self, span: tuple[int, int, int, int]) -> None:
+        """Mark the region a parse tree node covers. Positions are 1-based, as lark reports them."""
+        line, column, end_line, end_column = span
+        start = f"{line}.{max(column - 1, 0)}"
+        end = f"{end_line}.{max(end_column - 1, 0)}"
+        self.clear_span()
+        self.text.tag_add(SPAN_TAG, start, end)
+        self.text.see(start)
 
     def highlight_error(self, line: int, column: int) -> None:
         start = f"{line}.{max(column - 1, 0)}"
@@ -286,15 +484,87 @@ class EditorPane(ttk.Frame):
         return self.save() if answer else True
 
 
+class CorpusView(ttk.Frame):
+    """The Corpus tab: every case with its last result."""
+
+    def __init__(self, master: tk.Misc, on_open_case: Callable[[int], None]) -> None:
+        super().__init__(master)
+        self.on_open_case = on_open_case
+
+        self.summary = ttk.Label(self, anchor="w", padding=(4, 3), text="No corpus loaded")
+        self.summary.pack(fill="x")
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(body, columns=("expect", "result", "detail"), show="headings", selectmode="browse")
+        for column, heading, width in (
+            ("expect", "Expect", 70),
+            ("result", "Result", 70),
+            ("detail", "Detail", 240),
+        ):
+            self.tree.heading(column, text=heading, anchor="w")
+            self.tree.column(column, width=width, minwidth=60, stretch=column == "detail")
+        self.tree["columns"] = ("name", "expect", "result", "detail")
+        self.tree.heading("name", text="Case", anchor="w")
+        self.tree.column("name", width=180, minwidth=80, stretch=True)
+        self.tree.tag_configure(RESULT_PASS, foreground=PASS_COLOUR)
+        self.tree.tag_configure(RESULT_FAIL, foreground=ERROR_COLOUR)
+
+        vbar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+    def show(self, corpus: Corpus, summary: str) -> None:
+        selected = self.selected_index()
+        self.tree.delete(*self.tree.get_children())
+        for index, case in enumerate(corpus.cases):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(case.name, case.expect, case.result, case.detail),
+                tags=(case.result,) if case.result else (),
+            )
+        if selected is not None and 0 <= selected < len(corpus.cases):
+            self.tree.selection_set(str(selected))
+        name = corpus.path.name if corpus.path else "(unsaved)"
+        marker = " *" if corpus.dirty else ""
+        self.summary.configure(text=f"{name}{marker} - {summary}")
+
+    def selected_index(self) -> int | None:
+        selection = self.tree.selection()
+        return int(selection[0]) if selection else None
+
+    def _on_double_click(self, _event: tk.Event) -> str:
+        index = self.selected_index()
+        if index is not None:
+            self.on_open_case(index)
+        return "break"
+
+
 class ResultPane(ttk.Frame):
-    """The right hand pane: the parse result as pretty text and as a collapsible tree."""
+    """The right hand pane: the parse result as pretty text, as a collapsible tree, and the corpus."""
 
     def __init__(
-        self, master: tk.Misc, title: str, editor_font: tkfont.Font, on_view_change: Callable[[], None]
+        self,
+        master: tk.Misc,
+        title: str,
+        editor_font: tkfont.Font,
+        on_view_change: Callable[[], None],
+        on_open_case: Callable[[int], None],
+        on_node_selected: Callable[[object | None], None],
     ) -> None:
         super().__init__(master)
         self.base_title = title
         self.on_view_change = on_view_change
+        self.on_node_selected = on_node_selected
         self.pretty = ""
         self.nodes: dict[str, object] = {}
 
@@ -305,6 +575,8 @@ class ResultPane(ttk.Frame):
         self.notebook.pack(fill="both", expand=True)
         self.notebook.add(self._build_text_view(editor_font), text="Text")
         self.notebook.add(self._build_tree_view(), text="Tree")
+        self.corpus_view = CorpusView(self.notebook, on_open_case)
+        self.notebook.add(self.corpus_view, text="Corpus")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self.on_view_change())
 
         self.menu = tk.Menu(self, tearoff=False)
@@ -345,17 +617,23 @@ class ResultPane(ttk.Frame):
         frame.columnconfigure(0, weight=1)
 
         self.tree.bind("<Control-c>", self._on_copy)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Button-3>", self._on_context_menu)
         self.tree.bind("<Button-2>", self._on_context_menu)
         return frame
 
+    def _on_tree_select(self, _event: tk.Event) -> None:
+        selection = self.tree.selection()
+        self.on_node_selected(self.nodes.get(selection[0]) if selection else None)
+
     # -- views -----------------------------------------------------------------------------------
 
     def current_view(self) -> str:
-        return TREE_VIEW if self.notebook.index("current") == 1 else TEXT_VIEW
+        index = self.notebook.index("current")
+        return VIEW_ORDER[index] if 0 <= index < len(VIEW_ORDER) else TEXT_VIEW
 
     def select_view(self, view: str) -> None:
-        self.notebook.select(1 if view == TREE_VIEW else 0)
+        self.notebook.select(VIEW_ORDER.index(view) if view in VIEW_ORDER else 0)
 
     # -- content ---------------------------------------------------------------------------------
 
@@ -500,8 +778,8 @@ class StatusBar(ttk.Frame):
     def set_message(self, text: str, is_error: bool = False) -> None:
         self.message.configure(text=text, foreground=ERROR_COLOUR if is_error else OK_COLOUR)
 
-    def set_detail(self, text: str) -> None:
-        self.detail.configure(text=text)
+    def set_detail(self, text: str, is_error: bool = False) -> None:
+        self.detail.configure(text=text, foreground=ERROR_COLOUR if is_error else OK_COLOUR)
 
 
 class LarkIde(tk.Tk):
@@ -519,6 +797,11 @@ class LarkIde(tk.Tk):
         self.parser_name = tk.StringVar(value=self.settings.get("parser", DEFAULT_PARSER))
         self.start_rule = tk.StringVar(value=self.settings.get("start_rule", DEFAULT_START_RULE))
         self.result_view = tk.StringVar(value=self.settings.get("result_view", TEXT_VIEW))
+        self.run_corpus_on_parse = tk.BooleanVar(value=self.settings.get("run_corpus_on_parse", True))
+        self.corpus = Corpus()
+        self._corpus_summary = ""
+        self._last_parse_succeeded = False
+        self._parsed_source: str | None = None
         self._parse_job: str | None = None
         self._highlight_job: str | None = None
         self._restore_job: str | None = None
@@ -528,8 +811,9 @@ class LarkIde(tk.Tk):
         self._build_bindings()
         self.protocol("WM_DELETE_WINDOW", self.on_quit)
         self.result_pane.select_view(self.result_view.get())
+        self.refresh_corpus_view("no cases")
         self._restore_job = self.after(120, self._restore_sashes)
-        self._refresh_detail()
+        self._refresh_parser_badge()
         self.status.set_message("Ready" if lark else "The 'lark' package is not installed", is_error=lark is None)
 
     # -- construction ----------------------------------------------------------------------------
@@ -544,11 +828,36 @@ class LarkIde(tk.Tk):
         self.input_pane = EditorPane(
             self.panes, "Input", INPUT_FILETYPES, ".txt", self.editor_font, self.schedule_parse
         )
-        self.result_pane = ResultPane(self.panes, "Parse tree", self.editor_font, self.on_view_changed)
+        self.result_pane = ResultPane(
+            self.panes,
+            "Parse tree",
+            self.editor_font,
+            self.on_view_changed,
+            self.open_corpus_case,
+            self.on_node_selected,
+        )
         self.highlighter = GrammarHighlighter(self.grammar_pane.text)
 
         for pane in (self.grammar_pane, self.input_pane, self.result_pane):
             self.panes.add(pane, weight=1)
+
+        self.grammar_pane.set_file_commands(
+            [
+                ("New Grammar", self.grammar_pane.new_file),
+                ("Open Grammar...", self.open_grammar),
+                ("Save Grammar", self.save_grammar),
+                ("Save Grammar As...", self.save_grammar_as),
+            ]
+        )
+        self.input_pane.set_file_commands(
+            [
+                ("New Input", self.input_pane.new_file),
+                ("Open Input...", self.open_input),
+                ("Save Input", self.save_input),
+                ("Save Input As...", self.save_input_as),
+                ("Add Input as Case...", self.add_case),
+            ]
+        )
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(4, 0))
         self.status = StatusBar(self)
@@ -594,12 +903,33 @@ class LarkIde(tk.Tk):
         parse_menu.add_command(label="Set Start Rule...", command=self.ask_start_rule)
         menubar.add_cascade(label="Parse", menu=parse_menu)
 
+        corpus_menu = tk.Menu(menubar, tearoff=False)
+        corpus_menu.add_command(label="New Corpus", command=self.new_corpus)
+        corpus_menu.add_command(label="Open Corpus...", command=self.open_corpus)
+        corpus_menu.add_command(label="Save Corpus", command=self.save_corpus)
+        corpus_menu.add_command(label="Save Corpus As...", command=self.save_corpus_as)
+        corpus_menu.add_separator()
+        corpus_menu.add_command(label="Add Input as Case...", command=self.add_case)
+        corpus_menu.add_command(label="Add Input as Error Case...", command=self.add_error_case)
+        corpus_menu.add_command(label="Record Expected Tree", command=self.record_expected_tree)
+        corpus_menu.add_command(label="Clear Expected Tree", command=self.clear_expected_tree)
+        corpus_menu.add_command(label="Delete Case", command=self.delete_case)
+        corpus_menu.add_separator()
+        corpus_menu.add_command(label="Run Corpus", accelerator="F6", command=self.run_corpus_now)
+        corpus_menu.add_checkbutton(
+            label="Run On Every Parse", variable=self.run_corpus_on_parse, command=self.on_run_corpus_changed
+        )
+        menubar.add_cascade(label="Corpus", menu=corpus_menu)
+
         view_menu = tk.Menu(menubar, tearoff=False)
         view_menu.add_radiobutton(
             label="Text View", value=TEXT_VIEW, variable=self.result_view, command=self.on_view_selected
         )
         view_menu.add_radiobutton(
             label="Tree View", value=TREE_VIEW, variable=self.result_view, command=self.on_view_selected
+        )
+        view_menu.add_radiobutton(
+            label="Corpus View", value=CORPUS_VIEW, variable=self.result_view, command=self.on_view_selected
         )
         view_menu.add_separator()
         view_menu.add_command(label="Expand All", command=self.result_pane.expand_all)
@@ -621,6 +951,7 @@ class LarkIde(tk.Tk):
         self.bind_all("<Control-S>", lambda _event: self.input_pane.save())
         self.bind_all("<Control-q>", lambda _event: self.on_quit())
         self.bind_all("<F5>", lambda _event: self.parse_now())
+        self.bind_all("<F6>", lambda _event: self.run_corpus_now())
 
     # -- commands --------------------------------------------------------------------------------
 
@@ -662,6 +993,7 @@ class LarkIde(tk.Tk):
         self._remember(kind)
         if kind == GRAMMAR_KIND:
             self.highlighter.highlight()
+            self._autoload_corpus()
         self.parse_now()
 
     def _remember(self, kind: str) -> None:
@@ -687,6 +1019,180 @@ class LarkIde(tk.Tk):
     def copy_parse_tree(self) -> None:
         self.result_pane.copy_selection()
         self.status.set_message("Parse tree copied to the clipboard")
+
+    # -- corpus ----------------------------------------------------------------------------------
+
+    def new_corpus(self) -> None:
+        if not self.confirm_corpus_discard():
+            return
+        self.corpus.clear()
+        self.refresh_corpus_view("no cases")
+
+    def open_corpus(self) -> None:
+        if not self.confirm_corpus_discard():
+            return
+        chosen = filedialog.askopenfilename(
+            parent=self, title="Open corpus", filetypes=CORPUS_FILETYPES, defaultextension=CORPUS_SUFFIX
+        )
+        if chosen:
+            self.load_corpus(Path(chosen), announce=True)
+
+    def load_corpus(self, path: Path, announce: bool) -> bool:
+        try:
+            self.corpus.load(path)
+        except (OSError, ValueError) as exc:
+            if announce:
+                messagebox.showerror(APP_NAME, f"Cannot read {path}:\n{exc}", parent=self)
+            return False
+        self.run_corpus_now()
+        return True
+
+    def save_corpus(self) -> None:
+        if self.corpus.path is None:
+            self.save_corpus_as()
+            return
+        self._write_corpus(self.corpus.path)
+
+    def save_corpus_as(self) -> None:
+        suggested = self.corpus.path
+        if suggested is None and self.grammar_pane.path is not None:
+            suggested = Corpus.default_path_for(self.grammar_pane.path)
+        chosen = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save corpus as",
+            filetypes=CORPUS_FILETYPES,
+            defaultextension=CORPUS_SUFFIX,
+            initialfile=suggested.name if suggested else None,
+            initialdir=str(suggested.parent) if suggested else None,
+        )
+        if chosen:
+            self._write_corpus(Path(chosen))
+
+    def _write_corpus(self, path: Path) -> bool:
+        try:
+            self.corpus.save(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Cannot write {path}:\n{exc}", parent=self)
+            return False
+        self.refresh_corpus_view(self._corpus_summary or "not run")
+        self.status.set_message(f"Corpus saved to {path.name}")
+        return True
+
+    def confirm_corpus_discard(self) -> bool:
+        if not self.corpus.dirty:
+            return True
+        answer = messagebox.askyesnocancel(APP_NAME, "The corpus has unsaved changes.\nSave them first?", parent=self)
+        if answer is None:
+            return False
+        if answer:
+            self.save_corpus()
+            return not self.corpus.dirty
+        return True
+
+    def add_case(self) -> None:
+        self._add_case(EXPECT_PARSE)
+
+    def add_error_case(self) -> None:
+        self._add_case(EXPECT_ERROR)
+
+    def _add_case(self, expect: str) -> None:
+        text = self.input_pane.content()
+        if not text:
+            self.status.set_message("The input pane is empty, nothing to add", is_error=True)
+            return
+        default = self.input_pane.path.stem if self.input_pane.path else f"case {len(self.corpus.cases) + 1}"
+        name = simpledialog.askstring(APP_NAME, "Case name:", initialvalue=default, parent=self)
+        if not name or not name.strip():
+            return
+        tree = self.result_pane.pretty if expect == EXPECT_PARSE and self._last_parse_succeeded else None
+        self.corpus.add(CorpusCase(name=self.corpus.unique_name(name.strip()), text=text, expect=expect, tree=tree))
+        self.run_corpus_now()
+        self.result_pane.select_view(CORPUS_VIEW)
+
+    def selected_case(self) -> CorpusCase | None:
+        index = self.result_pane.corpus_view.selected_index()
+        if index is None or not 0 <= index < len(self.corpus.cases):
+            self.status.set_message("Select a case in the Corpus tab first", is_error=True)
+            return None
+        return self.corpus.cases[index]
+
+    def record_expected_tree(self) -> None:
+        case = self.selected_case()
+        if case is None:
+            return
+        if case.expect == EXPECT_ERROR:
+            self.status.set_message("An error case has no expected tree", is_error=True)
+            return
+        parser = self.build_parser(announce=True)
+        if parser is None:
+            return
+        try:
+            tree = parser.parse(case.text)
+        except lark_exceptions.LarkError as exc:
+            self.status.set_message(f"Case does not parse: {str(exc).splitlines()[0]}", is_error=True)
+            return
+        case.tree = tree.pretty().rstrip("\n")
+        self.corpus.dirty = True
+        self.run_corpus_now()
+
+    def clear_expected_tree(self) -> None:
+        case = self.selected_case()
+        if case is None:
+            return
+        case.tree = None
+        self.corpus.dirty = True
+        self.run_corpus_now()
+
+    def delete_case(self) -> None:
+        index = self.result_pane.corpus_view.selected_index()
+        if index is None or not 0 <= index < len(self.corpus.cases):
+            self.status.set_message("Select a case in the Corpus tab first", is_error=True)
+            return
+        self.corpus.remove(index)
+        self.run_corpus_now()
+
+    def open_corpus_case(self, index: int) -> None:
+        if not 0 <= index < len(self.corpus.cases):
+            return
+        if not self.input_pane.confirm_discard():
+            return
+        case = self.corpus.cases[index]
+        self.input_pane.set_content(case.text)
+        self.input_pane.path = None
+        self.parse_now()
+        self.status.set_message(f"Loaded case '{case.name}' into the input pane")
+
+    def run_corpus_now(self) -> None:
+        parser = self.build_parser(announce=False)
+        if parser is None:
+            self._corpus_summary = ""
+            self.refresh_corpus_view("not run, the grammar does not compile")
+            self.status.set_detail("")
+            return
+        passed, total = run_corpus(parser, self.corpus.cases)
+        self._show_corpus(self._describe_corpus(passed, total), is_error=passed < total)
+
+    @staticmethod
+    def _describe_corpus(passed: int, total: int) -> str:
+        if total == 0:
+            return "no cases"
+        return f"{passed}/{total} passed" if passed < total else f"all {total} passed"
+
+    def refresh_corpus_view(self, summary: str) -> None:
+        self.result_pane.corpus_view.show(self.corpus, summary)
+
+    def on_run_corpus_changed(self) -> None:
+        self.settings.set("run_corpus_on_parse", self.run_corpus_on_parse.get())
+        self.settings.save()
+        self.parse_now()
+
+    def _autoload_corpus(self) -> None:
+        """Adopt the corpus sitting next to a freshly opened grammar, if there is one."""
+        if self.grammar_pane.path is None or self.corpus.dirty:
+            return
+        candidate = Corpus.default_path_for(self.grammar_pane.path)
+        if candidate.is_file() and candidate != self.corpus.path:
+            self.load_corpus(candidate, announce=False)
 
     def clear_parse_tree(self) -> None:
         self.result_pane.clear()
@@ -718,7 +1224,7 @@ class LarkIde(tk.Tk):
     def on_parser_changed(self) -> None:
         self.settings.set("parser", self.parser_name.get())
         self.settings.save()
-        self._refresh_detail()
+        self._refresh_parser_badge()
         self.parse_now()
 
     def ask_start_rule(self) -> None:
@@ -727,7 +1233,7 @@ class LarkIde(tk.Tk):
             self.start_rule.set(answer.strip())
             self.settings.set("start_rule", self.start_rule.get())
             self.settings.save()
-            self._refresh_detail()
+            self._refresh_parser_badge()
             self.parse_now()
 
     def show_about(self) -> None:
@@ -735,7 +1241,8 @@ class LarkIde(tk.Tk):
         messagebox.showinfo(APP_NAME, f"{APP_NAME}\n\nA three pane workbench for Lark grammars.\nlark: {version}")
 
     def on_quit(self) -> None:
-        if not (self.grammar_pane.confirm_discard() and self.input_pane.confirm_discard()):
+        panes_clear = self.grammar_pane.confirm_discard() and self.input_pane.confirm_discard()
+        if not (panes_clear and self.confirm_corpus_discard()):
             return
         self._store_layout()
         self.settings.save()
@@ -777,36 +1284,75 @@ class LarkIde(tk.Tk):
         if self.auto_parse.get():
             self._parse_job = self.after(AUTO_PARSE_DELAY_MS, self.parse_now)
 
-    def parse_now(self) -> None:
-        if self._parse_job is not None:
-            self.after_cancel(self._parse_job)
-            self._parse_job = None
-        self.input_pane.clear_error()
-
+    def _compile_grammar(self) -> tuple[object | None, tuple[str, str] | None]:
+        """Compile the grammar pane. Returns (parser, problem); both are None for an empty grammar."""
         if lark is None:
-            self._report_error("The 'lark' package is not installed.\n\n    pip install lark", "lark is not installed")
-            return
-
+            return None, ("The 'lark' package is not installed.\n\n    pip install lark", "lark is not installed")
         grammar = self.grammar_pane.content()
         if not grammar.strip():
-            self.result_pane.clear()
-            self.status.set_message("Enter a grammar in the left pane")
-            return
-
-        started = time.perf_counter()
+            return None, None
         try:
             parser = lark.Lark(
                 grammar,
                 parser=self.parser_name.get(),
                 start=self.start_rule.get(),
                 propagate_positions=True,
+                **self._import_options(),
             )
         except lark_exceptions.LarkError as exc:
-            self._report_error(f"Grammar error\n\n{exc}", "Grammar error")
-            return
+            return None, (f"Grammar error\n\n{exc}", "Grammar error")
+        except OSError as exc:
+            return None, (f"Grammar error\n\n{exc}{self._import_hint()}", "Grammar error")
         except Exception as exc:  # noqa: BLE001 - a broken grammar can raise almost anything
-            self._report_error(f"Grammar error\n\n{type(exc).__name__}: {exc}", "Grammar error")
+            return None, (f"Grammar error\n\n{type(exc).__name__}: {exc}", "Grammar error")
+        return parser, None
+
+    def _import_options(self) -> dict:
+        """Let %import find grammars sitting next to the one being edited."""
+        path = self.grammar_pane.path
+        if path is None:
+            return {}
+        return {"source_path": str(path), "import_paths": [str(path.parent)]}
+
+    def _import_hint(self) -> str:
+        if self.grammar_pane.path is not None:
+            return ""
+        return "\n\nThe grammar has not been saved, so %import has no directory to resolve against."
+
+    def build_parser(self, announce: bool) -> object | None:
+        """The compiled grammar, or None. Used by the corpus commands outside a full parse."""
+        parser, problem = self._compile_grammar()
+        if parser is None and problem is not None and announce:
+            self._report_error(*problem)
+        return parser
+
+    def parse_now(self) -> None:
+        if self._parse_job is not None:
+            self.after_cancel(self._parse_job)
+            self._parse_job = None
+        self.input_pane.clear_error()
+        self.input_pane.clear_span()
+        self._last_parse_succeeded = False
+        self._parsed_source = None
+
+        started = time.perf_counter()
+        parser, problem = self._compile_grammar()
+        if parser is None:
+            self._corpus_summary = ""
+            self.status.set_detail("")
+            if problem is None:
+                self.result_pane.clear()
+                self._status("Enter a grammar in the left pane")
+            else:
+                self._report_error(*problem)
             return
+
+        if self.run_corpus_on_parse.get():
+            passed, total = run_corpus(parser, self.corpus.cases)
+            self._show_corpus(self._describe_corpus(passed, total), is_error=passed < total)
+        else:
+            self._corpus_summary = ""
+            self.status.set_detail("")
 
         source = self.input_pane.content()
         try:
@@ -822,7 +1368,9 @@ class LarkIde(tk.Tk):
         node_count = sum(1 for _ in tree.iter_subtrees())
         complete = self.result_pane.show_tree(tree, tree.pretty())
         suffix = "" if complete else f" (tree view truncated at {MAX_TREE_NODES} nodes)"
-        self.status.set_message(f"Parsed OK - {node_count} nodes in {elapsed_ms:.0f} ms{suffix}")
+        self._last_parse_succeeded = True
+        self._parsed_source = source
+        self._status(f"Parsed OK - {node_count} nodes in {elapsed_ms:.0f} ms{suffix}")
 
     def _report_unexpected_input(self, exc: Exception, source: str) -> None:
         line = getattr(exc, "line", None)
@@ -838,10 +1386,34 @@ class LarkIde(tk.Tk):
 
     def _report_error(self, body: str, status: str) -> None:
         self.result_pane.show_error(body)
-        self.status.set_message(status, is_error=True)
+        self._status(status, is_error=True)
 
-    def _refresh_detail(self) -> None:
-        self.status.set_detail(f"parser: {self.parser_name.get()}   start: {self.start_rule.get()}")
+    def _status(self, message: str, is_error: bool = False) -> None:
+        self.status.set_message(message, is_error=is_error)
+
+    def _refresh_parser_badge(self) -> None:
+        self.grammar_pane.set_badge(f"parser: {self.parser_name.get()}   start: {self.start_rule.get()}")
+
+    def _show_corpus(self, summary: str, is_error: bool = False) -> None:
+        """Put a corpus summary in its tab and in the right of the status line."""
+        self._corpus_summary = summary
+        self.refresh_corpus_view(summary or "no cases")
+        self.status.set_detail(f"corpus: {summary}" if summary else "", is_error=is_error)
+
+    def on_node_selected(self, node: object | None) -> None:
+        """Highlight in the input pane the text the selected tree node came from."""
+        if node is None:
+            self.input_pane.clear_span()
+            return
+        if self.input_pane.content() != self._parsed_source:
+            self.input_pane.clear_span()
+            self._status("The input has changed since the last parse, so spans are not shown", is_error=True)
+            return
+        span = node_span(node)
+        if span is None:
+            self.input_pane.clear_span()
+            return
+        self.input_pane.highlight_span(span)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

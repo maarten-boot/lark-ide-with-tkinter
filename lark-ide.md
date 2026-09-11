@@ -35,8 +35,9 @@ middle pane. When a grammar is given, an initial parse runs at startup.
 +--------------------------------------------------------------------------+
 | File   Edit   Parse   Help                                     (menu bar) |
 +------------------+------------------+------------------------------------+
-| Grammar - x.lark | Input - y.txt *  | Parse tree                          |
-|                  |                  | [ Text ][ Tree ]           (tabs)   |
+| Grammar - x.lark |                  |                                     |
+|   parser: earley | Input - y.txt *  | Parse tree                          |
+|                  |                  | [ Text ][ Tree ][ Corpus ] (tabs)   |
 | +--------------+ | +--------------+ | +--------------------------------+  |
 | |              | | |              | | |                                |  |
 | | editable     | | | editable     | | | read only                      |  |
@@ -44,7 +45,7 @@ middle pane. When a grammar is given, an initial parse runs at startup.
 | | scrollbars   | | | scrollbars   | | |                                |  |
 | +--------------+ | +--------------+ | +--------------------------------+  |
 +------------------+------------------+------------------------------------+
-| Parsed OK - 12 nodes in 3 ms          parser: earley   start: start       |
+| Parsed OK - 12 nodes in 3 ms                        corpus: 3/4 passed    |
 +--------------------------------------------------------------------------+
 ```
 
@@ -60,6 +61,10 @@ middle pane. When a grammar is given, an initial parse runs at startup.
 The header reads `<Title> - <filename>`, where the filename is `(unsaved)` when the pane has no file.
 An unsaved change appends ` *`. The right pane header is the fixed text `Parse tree`.
 
+The grammar pane's header also carries a right-aligned badge with the settings the next parse will
+use, `parser: earley   start: start`. It sits above the grammar because that is what those settings
+apply to, and it updates the moment the parser or start rule changes.
+
 ### 4.2 Status line
 
 One line at the bottom, separated from the panes by a horizontal rule.
@@ -71,7 +76,9 @@ One line at the bottom, separated from the panes by a horizontal rule.
   - `Grammar error`
   - `Parse error at line <l>, column <c>`
   - `Parse tree copied to the clipboard`
-- Right: the current parse settings, `parser: <earley|lalr>   start: <rule>`.
+- Right: the corpus result, `corpus: all 4 passed` or `corpus: 3/4 passed`, red when any case
+  failed. Empty when the corpus did not run for this parse, so it never shows a stale figure. The
+  parse settings are not repeated here; they live above the grammar pane (section 4.1).
 
 ## 5. Panes
 
@@ -107,10 +114,14 @@ dialog offers `*.txt` and `*.*`.
 When a parse fails at a known position, the offending character is given a pink background and is
 scrolled into view. The highlight is cleared at the start of every parse.
 
+Selecting a node in the tree view gives the text that node came from a blue background and scrolls
+it into view (section 5.3.2). The two marks are independent tags; the error mark draws on top.
+
 ### 5.3 Right - Parse tree
 
-Two views of the same result, in a `ttk.Notebook` with tabs **Text** and **Tree**. Both are filled
-on every successful parse, so switching tabs never triggers a reparse.
+A `ttk.Notebook` with tabs **Text**, **Tree** and **Corpus**. Text and Tree are two views of the
+same parse result and are both filled on every successful parse, so switching tabs never triggers a
+reparse. Corpus is described in section 9.
 
 #### 5.3.1 Text view
 
@@ -131,6 +142,14 @@ A `ttk.Treeview` with three columns:
 Token values longer than 80 characters are cut to 80 with a trailing `...`; tabs and newlines are
 shown escaped. All nodes are expanded when the tree is filled.
 
+Selecting a row highlights the matching text in the input pane, using `meta` for a rule node and the
+token's own position for a leaf. Nodes that carry no position, and rules whose children were all
+filtered out, highlight nothing.
+
+The highlight is refused outright if the input has been edited since the parse that produced the
+tree: the positions would point at the wrong text, so the status line says so instead. Clearing the
+selection, or any new parse, clears the highlight.
+
 To keep a runaway grammar from freezing the window, the tree view stops after 20000 nodes and adds a
 final `... truncated at 20000 nodes` row; the status line says so too. The text view is never
 truncated.
@@ -143,6 +162,16 @@ truncated.
   nothing is selected.
 - `Ctrl+A` selects all, in the text view only.
 - Right click (and middle click) opens a context menu with **Copy** and **Select All**.
+
+### 5.4 Context menus
+
+Right click (and middle click) in the grammar or input pane opens a menu with that pane's file
+commands at the top, then **Cut**, **Copy**, **Paste**, **Select All**, **Undo**, **Redo**. The file
+commands are the same ones the File menu offers for that pane, so they keep the recent-files list up
+to date; the input pane's menu also carries **Add Input as Case...**.
+
+The file commands are installed by the application after the panes are built, and replace any set
+before, so a pane never accumulates stale entries.
 
 ## 6. Menus and keyboard shortcuts
 
@@ -166,8 +195,20 @@ truncated.
 | Parse | Parser: earley        |                | Radio, default                                       |
 | Parse | Parser: lalr          |                | Radio                                                |
 | Parse | Set Start Rule...     |                | Prompts for the start rule, default `start`          |
+| Corpus| New Corpus            |                | Empties the corpus after the unsaved-changes check   |
+| Corpus| Open Corpus...        |                | Loads a corpus file and runs it                      |
+| Corpus| Save Corpus           |                | Saves the corpus; falls back to Save As if new       |
+| Corpus| Save Corpus As...     |                | Defaults to the name beside the current grammar      |
+| Corpus| Add Input as Case...  |                | Adds the input pane as a case expected to parse      |
+| Corpus| Add Input as Error Case... |           | Adds it as a case expected to fail                   |
+| Corpus| Record Expected Tree  |                | Stores the selected case's current tree              |
+| Corpus| Clear Expected Tree   |                | Drops it again, leaving a parses-or-not case         |
+| Corpus| Delete Case           |                | Removes the selected case                            |
+| Corpus| Run Corpus            | `F6`           | Runs every case now                                  |
+| Corpus| Run On Every Parse    |                | Checkbutton, on by default                           |
 | View  | Text View             |                | Radio, selects the Text tab                          |
 | View  | Tree View             |                | Radio, selects the Tree tab                          |
+| View  | Corpus View           |                | Radio, selects the Corpus tab                        |
 | View  | Expand All            |                | Opens every node in the tree view                    |
 | View  | Collapse All          |                | Closes every node in the tree view                   |
 | Help  | About                 |                | Application name and the installed `lark` version    |
@@ -180,6 +221,9 @@ keeps its contents.
 A pane is dirty once its text has been modified since the last load or save. Before an action that
 would discard a dirty pane (New, Open, Quit), a Yes/No/Cancel box asks whether to save first.
 **Yes** saves and continues, **No** discards and continues, **Cancel** abandons the action.
+
+The corpus is dirty once a case has been added, deleted, or had its expected tree recorded or
+cleared. It gets the same prompt before New Corpus, Open Corpus and Quit.
 
 ## 8. Parsing
 
@@ -201,6 +245,21 @@ input are re-read from the panes on every parse; nothing is cached.
 An empty or whitespace-only grammar is not an error: the right pane is emptied and the status line
 says `Enter a grammar in the left pane`.
 
+#### 8.2.1 Resolving `%import`
+
+When the grammar pane has a file, two more options are passed:
+
+- `source_path` is the grammar's own path, which is what `%import .module.rule` resolves against.
+- `import_paths` is the grammar's directory, which is what plain `%import module.rule` searches.
+
+So a grammar split across several files works as long as the pieces sit together, and two projects
+can each define their own `shared.lark` without colliding: the grammar currently loaded decides
+which one is found. Lark's bundled `common` grammars keep working either way.
+
+An unsaved grammar has no directory to resolve against, so it gets neither option. A `%import` of a
+local file then fails with a file-not-found error, and the report adds a line saying the grammar has
+not been saved, because the raw error does not make the cause obvious.
+
 ### 8.3 Results
 
 On success the right pane shows `Tree.pretty()`, and the status line reports the number of subtree
@@ -213,7 +272,99 @@ from `UnexpectedInput.get_context()` and the exception text. The context is omit
 exception message already contains it, so it never appears twice. The failing character is
 highlighted in the middle pane.
 
-## 9. Settings and recent files
+## 9. The corpus
+
+A corpus is a named set of sample inputs for one grammar, kept in a JSON file beside it. It exists
+to answer the question a single input pane cannot: *did this grammar edit break anything that used
+to work?*
+
+### 9.1 File format
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "simple pair",
+      "input": "a = 1\n",
+      "expect": "parse",
+      "tree": "start\n  pair\n    a\n    value\t1"
+    },
+    { "name": "missing value", "input": "a =\n", "expect": "error" }
+  ]
+}
+```
+
+- `name` is free text and is made unique on entry by appending ` (2)`, ` (3)` and so on.
+- `input` is the exact text to parse.
+- `expect` is `parse` or `error`. Anything else is read as `parse`.
+- `tree` is optional and only meaningful for `expect: parse`. When present it is the recorded
+  `pretty()` output, compared exactly after trailing newlines are stripped.
+
+Only those four keys are written. A case's last result is deliberately not persisted: it describes a
+run, not the case.
+
+A file that is missing, unreadable, not valid JSON, or has no `cases` list is reported as an error
+when the user asked for it by name, and ignored silently when it was found automatically.
+
+### 9.2 Where it lives
+
+The default path for a grammar is the grammar path with its suffix replaced by `.corpus.json`, so
+`demo.lark` pairs with `demo.corpus.json`. Opening a grammar adopts that file if it exists and the
+current corpus has no unsaved changes; if there is no such file the current corpus is left alone,
+because switching grammars to compare them is a normal thing to do.
+
+### 9.3 What a case proves
+
+| `expect` | `tree`   | The case passes when                                    |
+|----------|----------|---------------------------------------------------------|
+| `parse`  | absent   | the input parses                                        |
+| `parse`  | present  | the input parses **and** produces exactly that tree     |
+| `error`  | ignored  | the input fails to parse                                |
+
+The recorded tree is the point of the feature. A grammar edit that renames a rule, reassociates an
+operator or changes where a token lands still parses the same inputs; only the recorded tree
+notices. The trade-off is that recorded trees go stale on purpose: after an intended grammar change
+the affected cases fail until their trees are re-recorded.
+
+### 9.4 When it runs
+
+With **Run On Every Parse** on, the corpus runs on every parse that compiles the grammar, against
+the same compiled parser, before the input pane is parsed. It therefore runs even when the input
+pane itself does not parse. `F6` runs it on demand regardless of the setting.
+
+If the grammar does not compile, no case is run and the tab says so rather than reporting failures
+that are really one grammar error.
+
+### 9.5 The Corpus tab
+
+A row per case: **Case**, **Expect**, **Result**, **Detail**. Passing rows are green, failing rows
+red. `Detail` carries the first line of the parse error, or `tree differs from the recorded one`, or
+`parsed, but an error was expected`.
+
+Above the rows sits the corpus file name, a `*` when there are unsaved changes, and a summary:
+`all 4 passed`, `3/4 passed`, `no cases`, or `not run, the grammar does not compile`.
+
+Double clicking a row loads that case's text into the input pane, after the usual unsaved-changes
+check, and parses it. The input pane then has no file attached, so saving it will ask for a name
+rather than overwriting whatever was loaded before.
+
+Selecting a row is required by Record Expected Tree, Clear Expected Tree and Delete Case; without a
+selection they say so in the status line and do nothing.
+
+### 9.6 In the status line
+
+When the corpus has run, its summary appears on the right of the status line, separately from the
+parse outcome on the left:
+
+```
+Parsed OK - 12 nodes in 3 ms                        corpus: 3/4 passed
+```
+
+It is red when any case failed. It is cleared as soon as a parse runs without the corpus, so it
+never shows a stale result.
+
+## 10. Settings and recent files
 
 Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sorted keys.
 
@@ -224,7 +375,8 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | `parser`          | `earley` or `lalr`                                  | `earley`   |
 | `start_rule`      | The start rule name                                 | `start`    |
 | `auto_parse`      | Parse While Typing                                  | `true`     |
-| `result_view`     | `text` or `tree`                                    | `text`     |
+| `result_view`     | `text`, `tree` or `corpus`                          | `text`     |
+| `run_corpus_on_parse` | Run On Every Parse                              | `true`     |
 | `recent_grammar`  | Up to 20 absolute paths, most recent first          | `[]`       |
 | `recent_input`    | Up to 20 absolute paths, most recent first          | `[]`       |
 
@@ -243,11 +395,16 @@ Rules that keep the behaviour predictable:
 - Layout restore is best effort. Sash positions are reapplied 120 ms after startup and are skipped
   if they no longer fit the window.
 
-## 10. Structure of `lark-ide.py`
+## 11. Structure of `lark-ide.py`
 
 | Object        | Responsibility                                                              |
 |---------------|-----------------------------------------------------------------------------|
 | `Settings`    | Loading, saving and validating `settings.json`, including the recent lists   |
+| `CorpusCase`  | One case: name, input, expectation, optional recorded tree, last result      |
+| `Corpus`      | The case list, its file, dirty tracking, and the default path for a grammar  |
+| `run_corpus`  | Runs every case against a compiled parser and records the outcomes           |
+| `node_span`   | The line/column range a tree node or token covers, or None                   |
+| `CorpusView`  | The Corpus tab                                                              |
 | `GrammarHighlighter` | Regex based colouring of the grammar pane                            |
 | `EditorPane`  | Header, editable scrolled text, dirty tracking, open/save/new, error marking |
 | `ResultPane`  | The Text/Tree notebook, tree building, copy/select-all, context menu         |
@@ -256,26 +413,39 @@ Rules that keep the behaviour predictable:
 | `parse_args`  | Command line                                                                 |
 | `main`        | Builds the window, applies the command line, runs the main loop               |
 
-## 11. Code style
+## 12. Code style, tests and the Makefile
 
 4-space indent, 120-character lines, formatted and checked with
 `ruff format --line-length 120` and `ruff check --line-length 120`.
 
-`test_lark_ide.py` drives a real window and covers parsing, both result views, the read-only
-guarantee, clipboard behaviour, highlighting, file round-trips and settings persistence. It needs a
-display:
+`test_lark_ide.py` drives a real window and covers parsing, all three result views, the read-only
+guarantee, clipboard behaviour, highlighting, context menus, file round-trips, the corpus format and
+runner, and settings persistence.
 
-```
-HOME=$(mktemp -d) xvfb-run -a python3 test_lark_ide.py
-```
+The `Makefile` is the entry point:
 
-`HOME` is overridden so a test run cannot touch a real `~/.lark-ide/`.
+| Target         | Does                                                    |
+|----------------|---------------------------------------------------------|
+| `make run`     | Starts the application                                  |
+| `make format`  | `ruff format`                                           |
+| `make lint`    | `ruff check`                                            |
+| `make fix`     | `ruff check --fix`, then reformat                       |
+| `make test`    | Runs the suite                                          |
+| `make check`   | Format check, lint and tests: what CI should run        |
+| `make deps`    | Installs `lark` and `ruff`, warns if tkinter is missing |
+| `make clean`   | Removes caches                                          |
 
-## 12. Not in this version
+`make test` needs a display. With `DISPLAY` set it uses it; otherwise it falls back to `xvfb-run`,
+so the suite works over ssh. It always runs with a throwaway `HOME`, so a test run can never touch a
+real `~/.lark-ide/`.
+
+## 13. Not in this version
 
 Deliberately left out for now, listed here so the spec stays honest about its boundaries:
 
-- A saved corpus of test inputs re-run on every grammar edit (agreed as the next round).
 - Terminal/token view, `ambiguity='explicit'` forest display, railroad diagrams.
-- Clicking a tree node to select the matching span in the input.
-- Grammar `%import` resolution relative to the grammar file's directory.
+- A recent-corpora list; only grammars and inputs are remembered.
+- The reverse of the span highlight: selecting text in the input to find its tree node.
+- Watching imported grammar files and reparsing when one changes on disk.
+- Running a case under a start rule of its own, or with a per-case parser choice.
+- Re-recording every stale tree in one command after an intended grammar change.
