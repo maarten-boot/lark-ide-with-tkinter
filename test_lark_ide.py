@@ -306,7 +306,7 @@ class TestSettings(IdeTestCase):
 
         self.app.destroy()
         self.app = self.new_app()
-        menu = self.app.recent_menus[ide.GRAMMAR_KIND]
+        menu = self.app.recent_menus[ide.GRAMMAR_KIND][0]
         self.assertEqual(menu.entrycget(0, "label"), str(grammar.resolve()))
 
     def test_parser_choice_survives_a_restart(self) -> None:
@@ -349,7 +349,8 @@ class TestSettings(IdeTestCase):
         self.app.settings.remember(ide.GRAMMAR_KIND, path)
         self.app._rebuild_recent_menu(ide.GRAMMAR_KIND)
         self.app.clear_recent(ide.GRAMMAR_KIND)
-        self.assertEqual(self.app.recent_menus[ide.GRAMMAR_KIND].entrycget(0, "label"), "(empty)")
+        for menu in self.app.recent_menus[ide.GRAMMAR_KIND]:
+            self.assertEqual(menu.entrycget(0, "label"), "(empty)")
 
     def test_corrupt_settings_file_is_ignored(self) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,8 +381,10 @@ class TestContextMenus(IdeTestCase):
     def test_file_commands_are_replaced_not_appended(self) -> None:
         pane = self.app.grammar_pane
         before = pane.menu.index("end")
+        replaced = pane.file_command_count
         pane.set_file_commands([("New Grammar", pane.new_file)])
-        self.assertEqual(pane.menu.index("end"), before - 3)
+        self.assertEqual(pane.file_command_count, 2)  # the command plus its separator
+        self.assertEqual(pane.menu.index("end"), before - replaced + 2)
         self.assertEqual(pane.menu.entrycget(0, "label"), "New Grammar")
 
     def test_context_menu_select_all(self) -> None:
@@ -1303,6 +1306,226 @@ class TestLayout(IdeTestCase):
         self.app = self.new_app()
         self.app._restore_sashes()
         self.assertTrue(all(width > ide.MIN_PANE_WIDTH // 2 for width in self.widths()), self.widths())
+
+
+class TestRecentInContextMenus(IdeTestCase):
+    """The recent lists are offered on right click as well as from the File menu."""
+
+    def entries(self, menu) -> list[str]:
+        return [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) != "separator"]
+
+    def cascades(self, pane) -> list[str]:
+        menu = pane.menu
+        return [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) == "cascade"]
+
+    def write_files(self) -> tuple[Path, Path]:
+        grammar = self.tmp / "demo.lark"
+        grammar.write_text(GRAMMAR, encoding="utf-8")
+        text = self.tmp / "demo.txt"
+        text.write_text(INPUT, encoding="utf-8")
+        return grammar, text
+
+    def test_both_panes_offer_a_recent_submenu(self) -> None:
+        self.assertIn("Recent Grammars", self.cascades(self.app.grammar_pane))
+        self.assertIn("Recent Inputs", self.cascades(self.app.input_pane))
+
+    def test_two_menus_are_registered_per_kind(self) -> None:
+        """One in the File menu, one in the pane's context menu."""
+        self.assertEqual(len(self.app.recent_menus[ide.GRAMMAR_KIND]), 2)
+        self.assertEqual(len(self.app.recent_menus[ide.INPUT_KIND]), 2)
+
+    def test_every_menu_for_a_kind_is_kept_up_to_date(self) -> None:
+        grammar, _text = self.write_files()
+        self.app.open_recent(ide.GRAMMAR_KIND, grammar)
+        self.app.update()
+        for menu in self.app.recent_menus[ide.GRAMMAR_KIND]:
+            self.assertEqual(self.entries(menu)[0], str(grammar.resolve()))
+
+    def test_clearing_empties_every_menu_for_that_kind(self) -> None:
+        grammar, _text = self.write_files()
+        self.app.open_recent(ide.GRAMMAR_KIND, grammar)
+        self.app.clear_recent(ide.GRAMMAR_KIND)
+        self.app.update()
+        for menu in self.app.recent_menus[ide.GRAMMAR_KIND]:
+            self.assertEqual(self.entries(menu), ["(empty)"])
+
+    def test_the_two_kinds_stay_separate(self) -> None:
+        grammar, text = self.write_files()
+        self.app.open_recent(ide.GRAMMAR_KIND, grammar)
+        self.app.open_recent(ide.INPUT_KIND, text)
+        self.app.update()
+        for menu in self.app.recent_menus[ide.INPUT_KIND]:
+            self.assertNotIn(str(grammar.resolve()), self.entries(menu))
+
+
+class TestStartupRestore(IdeTestCase):
+    """With no files on the command line, the last ones used come back."""
+
+    def remember(self) -> tuple[Path, Path]:
+        grammar = self.tmp / "demo.lark"
+        grammar.write_text(GRAMMAR, encoding="utf-8")
+        text = self.tmp / "demo.txt"
+        text.write_text(INPUT, encoding="utf-8")
+        self.app.settings.remember(ide.GRAMMAR_KIND, grammar)
+        self.app.settings.remember(ide.INPUT_KIND, text)
+        self.app.settings.save()
+        return grammar, text
+
+    def test_the_last_files_are_reopened_and_parsed(self) -> None:
+        grammar, text = self.remember()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.assertTrue(self.app.load_last_session())
+        self.app.update()
+        self.assertEqual(self.app.grammar_pane.path, grammar)
+        self.assertEqual(self.app.input_pane.path, text)
+        self.assertIn("Parsed OK", self.status())
+
+    def test_restored_panes_are_not_dirty(self) -> None:
+        self.remember()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.app.load_last_session()
+        self.app.update()
+        self.assertFalse(self.app.grammar_pane.dirty)
+        self.assertFalse(self.app.input_pane.dirty)
+
+    def test_the_grammar_is_highlighted_after_restoring(self) -> None:
+        self.remember()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.app.load_last_session()
+        self.app.update()
+        self.assertTrue(self.app.grammar_pane.text.tag_ranges("directive"))
+
+    def test_the_corpus_beside_the_grammar_comes_back_too(self) -> None:
+        grammar, _text = self.remember()
+        corpus = ide.Corpus()
+        corpus.add(ide.CorpusCase(name="ok", text=INPUT))
+        corpus.save(ide.Corpus.default_path_for(grammar))
+        self.app.destroy()
+        self.app = self.new_app()
+        self.app.load_last_session()
+        self.app.update()
+        self.assertEqual([case.name for case in self.app.corpus.cases], ["ok"])
+
+    def test_nothing_remembered_means_nothing_loaded(self) -> None:
+        self.assertFalse(self.app.load_last_session())
+        self.assertIsNone(self.app.grammar_pane.path)
+
+    def test_a_deleted_file_is_not_restored(self) -> None:
+        grammar, _text = self.remember()
+        grammar.unlink()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.app.load_last_session()
+        self.app.update()
+        self.assertIsNone(self.app.grammar_pane.path)
+        self.assertIsNotNone(self.app.input_pane.path)
+
+
+class TestCommandLine(unittest.TestCase):
+    def test_no_arguments(self) -> None:
+        args = ide.parse_args([])
+        self.assertIsNone(args.grammar)
+        self.assertIsNone(args.input)
+        self.assertFalse(args.no_restore)
+
+    def test_both_files(self) -> None:
+        args = ide.parse_args(["a.lark", "b.txt"])
+        self.assertEqual(args.grammar, Path("a.lark"))
+        self.assertEqual(args.input, Path("b.txt"))
+
+    def test_no_restore_flag(self) -> None:
+        self.assertTrue(ide.parse_args(["--no-restore"]).no_restore)
+
+
+class TestRecentCorpora(IdeTestCase):
+    """Corpora are remembered the same way grammars and inputs are."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.app.grammar_pane.set_content(GRAMMAR)
+        self.app.input_pane.set_content(INPUT)
+
+    def entries(self, kind: str = ide.CORPUS_KIND) -> list[str]:
+        menu = self.app.recent_menus[kind][0]
+        return [menu.entrycget(i, "label") for i in range(menu.index("end") + 1) if menu.type(i) != "separator"]
+
+    def write_corpus(self, name: str = "demo.corpus.json") -> Path:
+        corpus = ide.Corpus()
+        corpus.add(ide.CorpusCase(name="ok", text=INPUT))
+        path = self.tmp / name
+        corpus.save(path)
+        return path
+
+    def test_the_corpus_menu_offers_a_recent_list(self) -> None:
+        self.assertEqual(self.entries(), ["(empty)"])
+
+    def test_opening_a_corpus_remembers_it(self) -> None:
+        path = self.write_corpus()
+        self.app.load_corpus(path, announce=False)
+        self.app.update()
+        self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [str(path.resolve())])
+        self.assertEqual(self.entries()[0], str(path.resolve()))
+
+    def test_saving_a_corpus_remembers_it(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="ok", text=INPUT))
+        path = self.tmp / "saved.corpus.json"
+        self.app._write_corpus(path)
+        self.app.update()
+        self.assertEqual(self.entries()[0], str(path.resolve()))
+
+    def test_a_corpus_adopted_beside_a_grammar_is_remembered(self) -> None:
+        grammar = self.tmp / "demo.lark"
+        grammar.write_text(GRAMMAR, encoding="utf-8")
+        corpus = self.write_corpus("demo.corpus.json")
+        self.app.open_recent(ide.GRAMMAR_KIND, grammar)
+        self.app.update()
+        self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [str(corpus.resolve())])
+
+    def test_opening_from_the_recent_list(self) -> None:
+        path = self.write_corpus()
+        self.app.open_recent(ide.CORPUS_KIND, path)
+        self.app.update()
+        self.assertEqual([case.name for case in self.app.corpus.cases], ["ok"])
+        self.assertEqual(self.app.corpus.path, path)
+
+    def test_the_newest_corpus_comes_first(self) -> None:
+        first = self.write_corpus("one.corpus.json")
+        second = self.write_corpus("two.corpus.json")
+        self.app.load_corpus(first, announce=False)
+        self.app.load_corpus(second, announce=False)
+        self.app.update()
+        self.assertEqual(self.entries()[:2], [str(second.resolve()), str(first.resolve())])
+
+    def test_a_deleted_corpus_drops_out_of_the_list(self) -> None:
+        path = self.write_corpus()
+        self.app.load_corpus(path, announce=False)
+        path.unlink()
+        self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [])
+
+    def test_clearing_the_corpus_list(self) -> None:
+        self.app.load_corpus(self.write_corpus(), announce=False)
+        self.app.clear_recent(ide.CORPUS_KIND)
+        self.app.update()
+        self.assertEqual(self.entries(), ["(empty)"])
+
+    def test_the_three_lists_stay_separate(self) -> None:
+        grammar = self.tmp / "demo.lark"
+        grammar.write_text(GRAMMAR, encoding="utf-8")
+        corpus = self.write_corpus("separate.corpus.json")
+        self.app.open_recent(ide.GRAMMAR_KIND, grammar)
+        self.app.load_corpus(corpus, announce=False)
+        self.assertEqual(self.app.settings.recent(ide.GRAMMAR_KIND), [str(grammar.resolve())])
+        self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [str(corpus.resolve())])
+        self.assertEqual(self.app.settings.recent(ide.INPUT_KIND), [])
+
+    def test_a_corpus_that_fails_to_load_is_not_remembered(self) -> None:
+        path = self.tmp / "bad.corpus.json"
+        path.write_text("not json", encoding="utf-8")
+        self.assertFalse(self.app.load_corpus(path, announce=False))
+        self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [])
 
 
 if __name__ == "__main__":

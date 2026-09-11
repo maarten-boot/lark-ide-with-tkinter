@@ -58,6 +58,8 @@ MAX_RECENT = 20
 
 GRAMMAR_KIND = "grammar"
 INPUT_KIND = "input"
+CORPUS_KIND = "corpus"
+RECENT_KINDS = (GRAMMAR_KIND, INPUT_KIND, CORPUS_KIND)
 
 TEXT_VIEW = "text"
 TREE_VIEW = "tree"
@@ -388,12 +390,18 @@ class EditorPane(ttk.Frame):
         self.text.bind("<Button-3>", self._on_context_menu)
         self.text.bind("<Button-2>", self._on_context_menu)
 
-    def set_file_commands(self, commands: list[tuple[str, Callable[[], None]]]) -> None:
-        """Insert file commands at the top of the context menu, replacing any set before."""
+    def set_file_commands(self, commands: list[tuple[str, object]]) -> None:
+        """Insert file entries at the top of the context menu, replacing any set before.
+
+        An entry is either a label and a callback, or a label and a submenu.
+        """
         for _ in range(self.file_command_count):
             self.menu.delete(0)
-        for index, (label, callback) in enumerate(commands):
-            self.menu.insert_command(index, label=label, command=callback)
+        for index, (label, target) in enumerate(commands):
+            if isinstance(target, tk.Menu):
+                self.menu.insert_cascade(index, label=label, menu=target)
+            else:
+                self.menu.insert_command(index, label=label, command=target)
         self.menu.insert_separator(len(commands))
         self.file_command_count = len(commands) + 1
 
@@ -1050,6 +1058,7 @@ class LarkIde(tk.Tk):
         self._watch_job: str | None = None
         self._import_key: tuple | None = None
         self._import_mtimes: dict[Path, int] = {}
+        self.recent_menus: dict[str, list[tk.Menu]] = {kind: [] for kind in RECENT_KINDS}
 
         self._build_body()
         self._build_menu()
@@ -1092,6 +1101,7 @@ class LarkIde(tk.Tk):
             [
                 ("New Grammar", self.grammar_pane.new_file),
                 ("Open Grammar...", self.open_grammar),
+                ("Recent Grammars", self._new_recent_menu(self.grammar_pane.menu, GRAMMAR_KIND)),
                 ("Save Grammar", self.save_grammar),
                 ("Save Grammar As...", self.save_grammar_as),
             ]
@@ -1100,6 +1110,7 @@ class LarkIde(tk.Tk):
             [
                 ("New Input", self.input_pane.new_file),
                 ("Open Input...", self.open_input),
+                ("Recent Inputs", self._new_recent_menu(self.input_pane.menu, INPUT_KIND)),
                 ("Save Input", self.save_input),
                 ("Save Input As...", self.save_input_as),
                 ("Add Input as Case...", self.add_case),
@@ -1114,18 +1125,16 @@ class LarkIde(tk.Tk):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=False)
-        self.recent_menus = {kind: tk.Menu(file_menu, tearoff=False) for kind in (GRAMMAR_KIND, INPUT_KIND)}
-
         file_menu.add_command(label="New Grammar", command=self.grammar_pane.new_file)
         file_menu.add_command(label="Open Grammar...", accelerator="Ctrl+O", command=self.open_grammar)
-        file_menu.add_cascade(label="Recent Grammars", menu=self.recent_menus[GRAMMAR_KIND])
+        file_menu.add_cascade(label="Recent Grammars", menu=self._new_recent_menu(file_menu, GRAMMAR_KIND))
         file_menu.add_command(label="Save Grammar", accelerator="Ctrl+S", command=self.save_grammar)
         file_menu.add_command(label="Save Grammar As...", command=self.save_grammar_as)
         file_menu.add_command(label="Export Railroad SVG...", command=self.export_railroad)
         file_menu.add_separator()
         file_menu.add_command(label="New Input", command=self.input_pane.new_file)
         file_menu.add_command(label="Open Input...", accelerator="Ctrl+Shift+O", command=self.open_input)
-        file_menu.add_cascade(label="Recent Inputs", menu=self.recent_menus[INPUT_KIND])
+        file_menu.add_cascade(label="Recent Inputs", menu=self._new_recent_menu(file_menu, INPUT_KIND))
         file_menu.add_command(label="Save Input", accelerator="Ctrl+Shift+S", command=self.save_input)
         file_menu.add_command(label="Save Input As...", command=self.save_input_as)
         file_menu.add_separator()
@@ -1161,6 +1170,7 @@ class LarkIde(tk.Tk):
         corpus_menu = tk.Menu(menubar, tearoff=False)
         corpus_menu.add_command(label="New Corpus", command=self.new_corpus)
         corpus_menu.add_command(label="Open Corpus...", command=self.open_corpus)
+        corpus_menu.add_cascade(label="Recent Corpora", menu=self._new_recent_menu(corpus_menu, CORPUS_KIND))
         corpus_menu.add_command(label="Save Corpus", command=self.save_corpus)
         corpus_menu.add_command(label="Save Corpus As...", command=self.save_corpus_as)
         corpus_menu.add_separator()
@@ -1208,7 +1218,7 @@ class LarkIde(tk.Tk):
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.configure(menu=menubar)
-        for kind in (GRAMMAR_KIND, INPUT_KIND):
+        for kind in RECENT_KINDS:
             self._rebuild_recent_menu(kind)
 
     def _build_bindings(self) -> None:
@@ -1250,9 +1260,16 @@ class LarkIde(tk.Tk):
             self._remember(INPUT_KIND)
 
     def open_recent(self, kind: str, path: Path) -> None:
-        pane = self.grammar_pane if kind == GRAMMAR_KIND else self.input_pane
+        if kind == CORPUS_KIND:
+            if self.confirm_corpus_discard():
+                self.load_corpus(path, announce=True)
+            return
+        pane = self._pane_for(kind)
         if pane.confirm_discard() and pane.load_path(path):
             self._after_file_action(kind)
+
+    def _pane_for(self, kind: str) -> EditorPane:
+        return self.grammar_pane if kind == GRAMMAR_KIND else self.input_pane
 
     def clear_recent(self, kind: str) -> None:
         self.settings.forget_all(kind)
@@ -1267,14 +1284,24 @@ class LarkIde(tk.Tk):
         self.parse_now()
 
     def _remember(self, kind: str) -> None:
-        pane = self.grammar_pane if kind == GRAMMAR_KIND else self.input_pane
-        if pane.path is not None:
-            self.settings.remember(kind, pane.path)
+        path = self.corpus.path if kind == CORPUS_KIND else self._pane_for(kind).path
+        if path is not None:
+            self.settings.remember(kind, path)
             self.settings.save()
             self._rebuild_recent_menu(kind)
 
+    def _new_recent_menu(self, parent: tk.Menu, kind: str) -> tk.Menu:
+        """A recent-files submenu. Several exist per kind, one per menu that offers the list."""
+        menu = tk.Menu(parent, tearoff=False)
+        self.recent_menus[kind].append(menu)
+        self._fill_recent_menu(menu, kind)
+        return menu
+
     def _rebuild_recent_menu(self, kind: str) -> None:
-        menu = self.recent_menus[kind]
+        for menu in self.recent_menus[kind]:
+            self._fill_recent_menu(menu, kind)
+
+    def _fill_recent_menu(self, menu: tk.Menu, kind: str) -> None:
         menu.delete(0, "end")
         entries = self.settings.recent(kind)
         for entry in entries:
@@ -1314,6 +1341,7 @@ class LarkIde(tk.Tk):
             if announce:
                 messagebox.showerror(APP_NAME, f"Cannot read {path}:\n{exc}", parent=self)
             return False
+        self._remember(CORPUS_KIND)
         self.run_corpus_now()
         return True
 
@@ -1344,6 +1372,7 @@ class LarkIde(tk.Tk):
         except (OSError, ValueError) as exc:
             messagebox.showerror(APP_NAME, f"Cannot write {path}:\n{exc}", parent=self)
             return False
+        self._remember(CORPUS_KIND)
         self.refresh_corpus_view(self._corpus_summary or "not run")
         self.status.set_message(f"Corpus saved to {path.name}")
         return True
@@ -1455,6 +1484,21 @@ class LarkIde(tk.Tk):
         self.settings.set("run_corpus_on_parse", self.run_corpus_on_parse.get())
         self.settings.save()
         self.parse_now()
+
+    def load_last_session(self) -> bool:
+        """Reopen the grammar and input used last time. Returns whether anything was loaded."""
+        loaded = False
+        for kind, pane in ((GRAMMAR_KIND, self.grammar_pane), (INPUT_KIND, self.input_pane)):
+            recent = self.settings.recent(kind)
+            if recent and pane.load_path(Path(recent[0])):
+                loaded = True
+        if not loaded:
+            return False
+        if self.grammar_pane.path is not None:
+            self.highlighter.highlight()
+            self._autoload_corpus()
+        self.parse_now()
+        return True
 
     def _autoload_corpus(self) -> None:
         """Adopt the corpus sitting next to a freshly opened grammar, if there is one."""
@@ -1944,18 +1988,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=APP_NAME, description="A three pane tkinter workbench for Lark grammars.")
     parser.add_argument("grammar", nargs="?", type=Path, help="grammar file to load into the left pane")
     parser.add_argument("input", nargs="?", type=Path, help="input file to load into the middle pane")
+    parser.add_argument(
+        "--no-restore",
+        action="store_true",
+        help="start with empty panes instead of reopening the files used last time",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     app = LarkIde()
-    if args.grammar:
-        app.grammar_pane.load_path(args.grammar)
-    if args.input:
-        app.input_pane.load_path(args.input)
-    if args.grammar:
+    if args.grammar or args.input:
+        if args.grammar:
+            app.grammar_pane.load_path(args.grammar)
+        if args.input:
+            app.input_pane.load_path(args.input)
+        if args.grammar:
+            app.highlighter.highlight()
+            app._autoload_corpus()
         app.parse_now()
+    elif not args.no_restore:
+        app.load_last_session()
     app.mainloop()
     return 0
 

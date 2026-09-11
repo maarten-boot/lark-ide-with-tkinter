@@ -23,11 +23,17 @@ parsing is attempted.
 ## 3. Invocation
 
 ```
-lark-ide.py [grammar] [input]
+lark-ide.py [grammar] [input] [--no-restore]
 ```
 
 Both positional arguments are optional. `grammar` is loaded into the left pane, `input` into the
 middle pane. When a grammar is given, an initial parse runs at startup.
+
+**With neither argument, the files used last time are reopened**: the newest entry from each recent
+list, the grammar highlighted and its corpus adopted, then parsed. A remembered file that has since
+been deleted is skipped, since the recent lists only ever report files that still exist. Giving
+either argument suppresses this, so `lark-ide.py other.lark` opens exactly what was asked for and
+nothing else. `--no-restore` starts with both panes empty.
 
 ## 4. Window layout
 
@@ -205,12 +211,17 @@ The stream is capped at 5000 tokens, and the header says so when it truncates.
 ### 5.4 Context menus
 
 Right click (and middle click) in the grammar or input pane opens a menu with that pane's file
-commands at the top, then **Cut**, **Copy**, **Paste**, **Select All**, **Undo**, **Redo**. The file
-commands are the same ones the File menu offers for that pane, so they keep the recent-files list up
-to date; the input pane's menu also carries **Add Input as Case...**.
+entries at the top, then **Cut**, **Copy**, **Paste**, **Select All**, **Undo**, **Redo**.
 
-The file commands are installed by the application after the panes are built, and replace any set
-before, so a pane never accumulates stale entries.
+The file entries are the same ones the File menu offers for that pane, including the **Recent
+Grammars** or **Recent Inputs** submenu, and they run the same commands, so the recent lists stay
+correct however a file was opened. The input pane's menu also carries **Add Input as Case...**.
+
+A recent list therefore appears in more than one menu. Each place gets its own `tk.Menu`, registered
+under its kind in `recent_menus`, and every menu for a kind is refilled whenever the list changes; a
+single menu widget shared between two parents does not behave reliably. An entry may be a command or
+a submenu, and the whole block is replaced rather than appended to, so a pane never accumulates
+stale entries.
 
 ## 6. Menus and keyboard shortcuts
 
@@ -239,6 +250,7 @@ before, so a pane never accumulates stale entries.
 | Parse | Watch Imported Files  |                | Checkbutton, on by default                            |
 | Corpus| New Corpus            |                | Empties the corpus after the unsaved-changes check   |
 | Corpus| Open Corpus...        |                | Loads a corpus file and runs it                      |
+| Corpus| Recent Corpora >      |                | Up to 20 remembered corpora, plus **Clear List**     |
 | Corpus| Save Corpus           |                | Saves the corpus; falls back to Save As if new       |
 | Corpus| Save Corpus As...     |                | Defaults to the name beside the current grammar      |
 | Corpus| Add Input as Case...  |                | Adds the input pane as a case expected to parse      |
@@ -545,11 +557,20 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | `show_ambiguity`  | Show Ambiguity                                      | `false`    |
 | `recent_grammar`  | Up to 20 absolute paths, most recent first          | `[]`       |
 | `recent_input`    | Up to 20 absolute paths, most recent first          | `[]`       |
+| `recent_corpus`   | Up to 20 absolute paths, most recent first          | `[]`       |
 
 Rules that keep the behaviour predictable:
 
+Three lists are kept, for grammars, inputs and corpora. They share one implementation and behave
+the same way:
+
 - Paths are stored absolute and resolved. Re-opening a file moves it to the front rather than
   duplicating it.
+- The newest grammar and input are what a bare `lark-ide.py` reopens (section 3). The corpus list
+  is not used for that, because a corpus arrives with its grammar: opening a grammar adopts the
+  corpus sitting beside it (section 9.2).
+- A corpus joins the list when it is opened, saved, or adopted automatically alongside a grammar. A
+  file that failed to load does not, so a corrupt path does not linger in the menu.
 - A remembered path whose file no longer exists is filtered out when the list is read, so it never
   appears in the menu and is dropped on the next save.
 - Settings are written whenever one of them changes (opening or saving a file, switching parser,
@@ -632,5 +653,4 @@ Deliberately left out for now, listed here so the spec stays honest about its bo
 - Stepping through alternative derivations side by side, rather than as nested tree rows.
 - Drawing railroad diagrams inside the application; export only.
 - Diagramming terminal regexes rather than showing them as a box.
-- A recent-corpora list; only grammars and inputs are remembered.
 - Re-recording every stale tree in one command after an intended grammar change.
