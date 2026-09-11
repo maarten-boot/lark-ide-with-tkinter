@@ -84,6 +84,9 @@ MAX_TOKENS = 5000
 
 HIGHLIGHT_DELAY_MS = 150
 WATCH_INTERVAL_MS = 1000
+MIN_PANE_WIDTH = 80
+RESTORE_RETRY_MS = 120
+DEFAULT_SASH_FRACTIONS = (1 / 3, 2 / 3)
 SYNTAX_COLOURS = {
     "comment": "#6a737d",
     "directive": "#a626a4",
@@ -1055,7 +1058,7 @@ class LarkIde(tk.Tk):
         self.result_pane.select_view(self.result_view.get())
         self.refresh_corpus_view("no cases")
         self._restore_job = self.after(120, self._restore_sashes)
-        self._watch_job = self.after(WATCH_INTERVAL_MS, self._check_imports)
+        self._watch_job = self.after(WATCH_INTERVAL_MS, self._watch_tick)
         self._refresh_parser_badge()
         self.status.set_message("Ready" if lark else "The 'lark' package is not installed", is_error=lark is None)
 
@@ -1193,6 +1196,8 @@ class LarkIde(tk.Tk):
             label="Follow Cursor in Tree", variable=self.follow_cursor, command=self.on_follow_cursor_changed
         )
         view_menu.add_command(label="Find Node at Cursor", accelerator="F7", command=self.find_node_at_cursor)
+        view_menu.add_separator()
+        view_menu.add_command(label="Reset Layout", command=self.reset_layout)
         view_menu.add_separator()
         view_menu.add_command(label="Expand All", command=self.result_pane.expand_all)
         view_menu.add_command(label="Collapse All", command=self.result_pane.collapse_all)
@@ -1524,21 +1529,58 @@ class LarkIde(tk.Tk):
     def _store_layout(self) -> None:
         self.settings.set("geometry", self.winfo_geometry())
         self.settings.set("result_view", self.result_pane.current_view())
+        self.settings.data.pop("sashes", None)  # absolute positions from older versions
+        width = self.panes.winfo_width()
+        if width < 3 * MIN_PANE_WIDTH:
+            return  # the window was never really laid out, so there is nothing worth storing
         try:
-            self.settings.set("sashes", [self.panes.sashpos(0), self.panes.sashpos(1)])
+            fractions = [round(self.panes.sashpos(index) / width, 4) for index in (0, 1)]
         except tk.TclError:
-            return  # the window was never mapped, so there is nothing worth storing
-
-    def _restore_sashes(self) -> None:
-        self._restore_job = None
-        sashes = self.settings.get("sashes", [])
-        if len(sashes) != 2 or not all(isinstance(value, int) and value > 0 for value in sashes):
             return
+        self.settings.set("sash_fractions", fractions)
+
+    def _restore_sashes(self, attempts: int = 8) -> None:
+        """Place the dividers once the window manager has actually sized the window."""
+        self._restore_job = None
+        if self.apply_sash_fractions(self._stored_fractions()) or attempts <= 1:
+            return
+        # Not mapped at its real size yet. Compositing window managers can take a while.
+        self._restore_job = self.after(RESTORE_RETRY_MS, lambda: self._restore_sashes(attempts - 1))
+
+    def _stored_fractions(self) -> tuple[float, float]:
+        """Stored column proportions, or the default thirds if they are missing or nonsensical."""
+        values = self.settings.get("sash_fractions", [])
+        if len(values) != 2:
+            return DEFAULT_SASH_FRACTIONS
         try:
-            for index, position in enumerate(sashes):
-                self.panes.sashpos(index, position)
+            first, second = float(values[0]), float(values[1])
+        except (TypeError, ValueError):
+            return DEFAULT_SASH_FRACTIONS
+        if not 0 < first < second < 1:
+            return DEFAULT_SASH_FRACTIONS
+        return first, second
+
+    def apply_sash_fractions(self, fractions: tuple[float, float]) -> bool:
+        """Place the dividers at proportions of the current width, never crushing a column."""
+        width = self.panes.winfo_width()
+        if width < 3 * MIN_PANE_WIDTH:
+            return False
+        first = int(width * fractions[0])
+        second = int(width * fractions[1])
+        first = max(MIN_PANE_WIDTH, min(first, width - 2 * MIN_PANE_WIDTH))
+        second = max(first + MIN_PANE_WIDTH, min(second, width - MIN_PANE_WIDTH))
+        try:
+            self.panes.sashpos(0, first)
+            self.panes.sashpos(1, second)
         except tk.TclError:
-            return  # a stored position no longer fits this window; the default split stands
+            return False
+        return True
+
+    def reset_layout(self) -> None:
+        self.apply_sash_fractions(DEFAULT_SASH_FRACTIONS)
+        self.settings.set("sash_fractions", list(DEFAULT_SASH_FRACTIONS))
+        self.settings.save()
+        self._status("Layout reset to three equal columns")
 
     # -- parsing ---------------------------------------------------------------------------------
 
@@ -1769,15 +1811,23 @@ class LarkIde(tk.Tk):
                 changed.append(path)
         return changed
 
-    def _check_imports(self) -> None:
+    def check_imports(self) -> bool:
+        """Reparse if a watched file changed since last look. Returns whether anything had."""
+        if not self.watch_imports.get():
+            return False
+        changed = self._changed_imports()
+        if not changed:
+            return False
+        names = ", ".join(sorted(path.name for path in changed))
+        self.parse_now()
+        self._status(f"Reparsed: {names} changed on disk")
+        return True
+
+    def _watch_tick(self) -> None:
+        """The timer body. Kept apart from check_imports so calling that never orphans the timer."""
         self._watch_job = None
-        if self.watch_imports.get():
-            changed = self._changed_imports()
-            if changed:
-                names = ", ".join(sorted(path.name for path in changed))
-                self.parse_now()
-                self._status(f"Reparsed: {names} changed on disk")
-        self._watch_job = self.after(WATCH_INTERVAL_MS, self._check_imports)
+        self.check_imports()
+        self._watch_job = self.after(WATCH_INTERVAL_MS, self._watch_tick)
 
     def on_watch_imports_changed(self) -> None:
         self.settings.set("watch_imports", self.watch_imports.get())

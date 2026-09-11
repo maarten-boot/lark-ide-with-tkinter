@@ -57,18 +57,23 @@ class IdeTestCase(unittest.TestCase):
         self.settings_path = self.tmp / "settings.json"
         self._original_settings_path = ide.SETTINGS_PATH
         ide.SETTINGS_PATH = self.settings_path
+        self.windows: list = []
         self.app = self.new_app()
 
     def tearDown(self) -> None:
         ide.SETTINGS_PATH = self._original_settings_path
-        try:
-            self.app.destroy()
-        except tk.TclError:
-            pass
+        # Every window ever built here, not just self.app: a survivor keeps its timers running
+        # and they fire against a destroyed interpreter later, in some unrelated test.
+        for window in self.windows:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
 
     def new_app(self) -> object:
         app = ide.LarkIde()
         app.update()
+        self.windows.append(app)
         return app
 
     def parse(self, grammar: str = GRAMMAR, text: str = INPUT) -> None:
@@ -297,7 +302,7 @@ class TestSettings(IdeTestCase):
         self.app.settings.save()
         saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["recent_grammar"], [str(grammar.resolve())])
-        self.assertEqual(len(saved["sashes"]), 2)
+        self.assertEqual(len(saved["sash_fractions"]), 2)
 
         self.app.destroy()
         self.app = self.new_app()
@@ -868,20 +873,20 @@ class TestWatchingImports(IdeTestCase):
     def test_a_changed_import_triggers_a_reparse(self) -> None:
         self.assertIn("Parsed OK", self.status())
         self.touch_shared(self.STRINGS)
-        self.app._check_imports()
+        self.app.check_imports()
         self.app.update()
         self.assertIn("shared.lark changed on disk", self.status())
         self.assertIn("Parse error", self.app.result_pane.text.get("1.0", "end"))
 
     def test_an_unchanged_import_does_nothing(self) -> None:
         before = self.status()
-        self.app._check_imports()
+        self.app.check_imports()
         self.app.update()
         self.assertEqual(self.status(), before)
 
     def test_a_deleted_import_counts_as_a_change(self) -> None:
         self.shared.unlink()
-        self.app._check_imports()
+        self.app.check_imports()
         self.app.update()
         self.assertIn("changed on disk", self.status())
 
@@ -889,7 +894,7 @@ class TestWatchingImports(IdeTestCase):
         self.app.watch_imports.set(False)
         before = self.status()
         self.touch_shared(self.STRINGS)
-        self.app._check_imports()
+        self.app.check_imports()
         self.app.update()
         self.assertEqual(self.status(), before)
 
@@ -900,7 +905,7 @@ class TestWatchingImports(IdeTestCase):
         self.assertEqual(self.app._import_mtimes, {})
 
     def test_an_unsaved_grammar_watches_nothing(self) -> None:
-        self.assertEqual(ide.LarkIde._imported_files(self.new_app()), [])
+        self.assertEqual(self.new_app()._imported_files(), [])
 
 
 class TestPerCaseParserOptions(IdeTestCase):
@@ -1203,6 +1208,101 @@ class TestRailroadExport(IdeTestCase):
         self.app.export_railroad()
         self.app.update()
         self.assertIn("no grammar to draw", self.status())
+
+
+class TestLayout(IdeTestCase):
+    """Column widths. A stored layout must never be able to hide a column."""
+
+    def pane_width(self) -> int:
+        self.app.update_idletasks()
+        return self.app.panes.winfo_width()
+
+    def sashes(self) -> tuple[int, int]:
+        self.app.update_idletasks()
+        return self.app.panes.sashpos(0), self.app.panes.sashpos(1)
+
+    def widths(self) -> list[int]:
+        self.app.update_idletasks()
+        return [p.winfo_width() for p in (self.app.grammar_pane, self.app.input_pane, self.app.result_pane)]
+
+    def test_the_default_is_three_equal_columns(self) -> None:
+        self.app.apply_sash_fractions(ide.DEFAULT_SASH_FRACTIONS)
+        widths = self.widths()
+        self.assertLess(max(widths) - min(widths), 20)
+
+    def test_no_stored_layout_gives_the_default(self) -> None:
+        self.assertEqual(self.app._stored_fractions(), ide.DEFAULT_SASH_FRACTIONS)
+
+    def test_absolute_positions_from_older_versions_are_ignored(self) -> None:
+        """They were saved in pixels against a window that may have been any size."""
+        self.app.settings.set("sashes", [5, 10])
+        self.assertEqual(self.app._stored_fractions(), ide.DEFAULT_SASH_FRACTIONS)
+
+    def test_absolute_positions_are_dropped_on_save(self) -> None:
+        self.app.settings.set("sashes", [5, 10])
+        self.app._store_layout()
+        self.assertNotIn("sashes", self.app.settings.data)
+
+    def test_proportions_round_trip(self) -> None:
+        self.app.apply_sash_fractions((0.25, 0.5))
+        self.app._store_layout()
+        first, second = self.app._stored_fractions()
+        self.assertAlmostEqual(first, 0.25, places=1)
+        self.assertAlmostEqual(second, 0.5, places=1)
+
+    def test_out_of_order_proportions_are_ignored(self) -> None:
+        self.app.settings.set("sash_fractions", [0.9, 0.2])
+        self.assertEqual(self.app._stored_fractions(), ide.DEFAULT_SASH_FRACTIONS)
+
+    def test_proportions_outside_the_window_are_ignored(self) -> None:
+        for values in ([0.0, 0.5], [0.5, 1.0], [-0.2, 0.5], [0.5]):
+            self.app.settings.set("sash_fractions", values)
+            self.assertEqual(self.app._stored_fractions(), ide.DEFAULT_SASH_FRACTIONS, values)
+
+    def test_garbage_proportions_are_ignored(self) -> None:
+        self.app.settings.set("sash_fractions", ["x", None])
+        self.assertEqual(self.app._stored_fractions(), ide.DEFAULT_SASH_FRACTIONS)
+
+    def test_extreme_proportions_are_clamped_so_every_column_survives(self) -> None:
+        self.app.apply_sash_fractions((0.97, 0.98))
+        first, second = self.sashes()
+        width = self.pane_width()
+        self.assertLessEqual(first, width - 2 * ide.MIN_PANE_WIDTH)
+        self.assertGreaterEqual(second - first, ide.MIN_PANE_WIDTH)
+        self.assertGreaterEqual(width - second, ide.MIN_PANE_WIDTH - 1)
+
+    def test_placing_reports_whether_it_worked(self) -> None:
+        self.assertTrue(self.app.apply_sash_fractions((0.3, 0.6)))
+
+    def test_restore_retries_until_the_window_is_mapped(self) -> None:
+        """A compositing window manager may not have sized the window when the first try runs."""
+        calls = []
+        self.app.apply_sash_fractions = lambda fractions: calls.append(fractions) or False
+        self.app._restore_sashes(attempts=3)
+        self.assertIsNotNone(self.app._restore_job)
+        self.assertEqual(len(calls), 1)
+
+    def test_restore_gives_up_rather_than_retrying_forever(self) -> None:
+        self.app.apply_sash_fractions = lambda _fractions: False
+        self.app._restore_sashes(attempts=1)
+        self.assertIsNone(self.app._restore_job)
+
+    def test_reset_layout_restores_equal_columns(self) -> None:
+        self.app.apply_sash_fractions((0.8, 0.9))
+        self.app.reset_layout()
+        widths = self.widths()
+        self.assertLess(max(widths) - min(widths), 20)
+        self.assertIn("Layout reset", self.status())
+        self.assertEqual(self.app.settings.get("sash_fractions", []), list(ide.DEFAULT_SASH_FRACTIONS))
+
+    def test_every_column_is_visible_after_a_restart(self) -> None:
+        self.app.apply_sash_fractions((0.25, 0.5))
+        self.app._store_layout()
+        self.app.settings.save()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.app._restore_sashes()
+        self.assertTrue(all(width > ide.MIN_PANE_WIDTH // 2 for width in self.widths()), self.widths())
 
 
 if __name__ == "__main__":

@@ -4,21 +4,21 @@
 lines: ( line )*
 line: entity | attrib | atype | validator
 
-entity: "E:" name ( "(" entity_names? ")" )? attribs? validators?
+entity: "E" ":" name ( "(" entity_names? ")" )? attribs? validators?
 entity_names: entity_name ( "," entity_name )*
 entity_name: name
 
 attribs: "{" ( attrib  ( "," attrib )* "," )? "}"
-attrib: "A:" name ( "(" attrib_names? ")" )? atype? validators?
+attrib: "A" ":" name ( "(" attrib_names? ")" )? atype? validators?
 attrib_names: attrib_name ( "," attrib_name )*
 attrib_name: name 
 
-atype: "T:" name ( "(" atype_names? ")" )?
+atype: "T" ":" name ( "(" atype_names? ")" )?
 atype_names: atype_name ( "," atype_name )*
 atype_name: name
 
 validators: "{" validator ( "," validator )* ","? "}"
-validator: "V:" name ( "(" validator_names? ")" )?
+validator: "V" ":" name ( "(" validator_names? ")" )?
 validator_names: validator_name ( "," validator_name )*
 validator_name: name
 

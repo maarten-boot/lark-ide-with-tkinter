@@ -49,8 +49,8 @@ middle pane. When a grammar is given, an initial parse runs at startup.
 +--------------------------------------------------------------------------+
 ```
 
-- The three columns live in a horizontal `ttk.PanedWindow`; the dividers are draggable and each
-  column starts with equal weight.
+- The three columns live in a horizontal `ttk.PanedWindow`; the dividers are draggable and start at
+  three equal columns, or wherever they were left last time (section 11).
 - Every column has a header label above the text, a vertical scrollbar on the right and a horizontal
   scrollbar below. Word wrap is off in all three panes.
 - All three text widgets use `TkFixedFont`.
@@ -256,6 +256,7 @@ before, so a pane never accumulates stale entries.
 | View  | Corpus View           |                | Radio, selects the Corpus tab                        |
 | View  | Follow Cursor in Tree |                | Checkbutton, on by default                            |
 | View  | Find Node at Cursor   | `F7`           | Selects the node covering the caret, showing the tree|
+| View  | Reset Layout          |                | Three equal columns again                            |
 | View  | Expand All            |                | Opens every node in the tree view                    |
 | View  | Collapse All          |                | Closes every node in the tree view                   |
 | Help  | About                 |                | Application name and the installed `lark` version    |
@@ -333,6 +334,10 @@ grammar across files.
 
 With **Parse > Watch Imported Files** on (the default), the imported files are polled once a second
 and any change triggers a reparse, with `Reparsed: shared.lark changed on disk` in the status line.
+
+The timer body and the check are separate methods, `_watch_tick` and `check_imports`. Calling the
+check directly is therefore safe: it does not touch the pending timer, so the timer can still be
+cancelled when the window closes.
 
 - The list comes from `lark.load_grammar.list_grammar_imports`, so it is what lark actually resolved,
   recursively, not a guess from reading `%import` lines.
@@ -529,7 +534,7 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | Key               | Meaning                                             | Default    |
 |-------------------|-----------------------------------------------------|------------|
 | `geometry`        | Window geometry string from the last quit           | `1400x850` |
-| `sashes`          | The two pane divider positions, in pixels           | even split |
+| `sash_fractions`  | The two dividers as proportions of the window width | `[0.33, 0.67]` |
 | `parser`          | `earley` or `lalr`                                  | `earley`   |
 | `start_rule`      | The start rule name                                 | `start`    |
 | `auto_parse`      | Parse While Typing                                  | `true`     |
@@ -553,8 +558,18 @@ Rules that keep the behaviour predictable:
 - A settings file that is missing, unreadable or not valid JSON is treated as empty; a value of the
   wrong type falls back to its default. The application never reports a settings problem to the
   user, because nothing about the current session depends on one.
-- Layout restore is best effort. Sash positions are reapplied 120 ms after startup and are skipped
-  if they no longer fit the window.
+- The dividers are stored as proportions of the pane area, not pixels, so a layout saved on a wide
+  screen still makes sense on a narrow one. They are reapplied 120 ms after startup, and retried up
+  to eight times at that interval until the window manager has actually sized the window: until it
+  has, the pane area is one pixel wide and there is nothing sensible to place.
+- Stored proportions are validated before use: two values, both between 0 and 1, in increasing
+  order. Anything else falls back to three equal columns. On applying them, each column is clamped
+  to at least 80 pixels, so no stored layout can leave a column invisible.
+- The `sashes` key written by earlier versions held absolute pixel positions and is ignored and
+  removed on the next save. Those could hide a column outright when the window was later opened at a
+  different size.
+- **View > Reset Layout** puts the dividers back to three equal columns, for when a layout has been
+  dragged somewhere unhelpful.
 
 ## 12. Structure of the code
 
