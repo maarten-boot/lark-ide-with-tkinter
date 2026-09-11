@@ -8,8 +8,9 @@ RUFF        ?= ruff
 LINE_LENGTH ?= 120
 
 APP     := lark-ide.py
+LIB     := lark_railroad.py
 TESTS   := test_lark_ide.py
-SOURCES := $(APP) $(TESTS)
+SOURCES := $(APP) $(LIB) $(TESTS)
 
 # A throwaway HOME so a test run can never touch a real ~/.lark-ide/.
 TEST_HOME := $(shell mktemp -d)

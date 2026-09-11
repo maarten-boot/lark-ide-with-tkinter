@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
+
+import lark
 
 HERE = Path(__file__).resolve().parent
 GRAMMAR = (
@@ -41,6 +46,7 @@ def load_module():
 
 
 ide = load_module()
+railroad = importlib.import_module("lark_railroad")
 
 
 class IdeTestCase(unittest.TestCase):
@@ -435,32 +441,32 @@ class TestCorpusModel(IdeTestCase):
 
     def test_a_case_that_parses_passes(self) -> None:
         cases = [ide.CorpusCase(name="ok", text=INPUT)]
-        self.assertEqual(ide.run_corpus(self.parser(), cases), (1, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(self.parser()), cases), (1, 1))
         self.assertEqual(cases[0].result, ide.RESULT_PASS)
 
     def test_a_case_that_does_not_parse_fails(self) -> None:
         cases = [ide.CorpusCase(name="bad", text="a = ?")]
-        self.assertEqual(ide.run_corpus(self.parser(), cases), (0, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(self.parser()), cases), (0, 1))
         self.assertEqual(cases[0].result, ide.RESULT_FAIL)
         self.assertTrue(cases[0].detail)
 
     def test_an_error_case_passes_when_it_fails_to_parse(self) -> None:
         cases = [ide.CorpusCase(name="bad", text="a = ?", expect=ide.EXPECT_ERROR)]
-        self.assertEqual(ide.run_corpus(self.parser(), cases), (1, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(self.parser()), cases), (1, 1))
 
     def test_an_error_case_fails_when_it_parses(self) -> None:
         cases = [ide.CorpusCase(name="fine", text=INPUT, expect=ide.EXPECT_ERROR)]
-        self.assertEqual(ide.run_corpus(self.parser(), cases), (0, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(self.parser()), cases), (0, 1))
         self.assertIn("error was expected", cases[0].detail)
 
     def test_a_recorded_tree_is_compared(self) -> None:
         parser = self.parser()
         recorded = parser.parse(INPUT).pretty().rstrip("\n")
         good = [ide.CorpusCase(name="ok", text=INPUT, tree=recorded)]
-        self.assertEqual(ide.run_corpus(parser, good), (1, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(parser), good), (1, 1))
 
         stale = [ide.CorpusCase(name="stale", text=INPUT, tree="start\n  something_else")]
-        self.assertEqual(ide.run_corpus(parser, stale), (0, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(parser), stale), (0, 1))
         self.assertIn("differs", stale[0].detail)
 
     def test_a_grammar_change_that_keeps_parsing_still_fails_a_recorded_case(self) -> None:
@@ -469,7 +475,7 @@ class TestCorpusModel(IdeTestCase):
         recorded = parser.parse("a = 1\n").pretty().rstrip("\n")
         renamed = GRAMMAR.replace("pair:", "binding:").replace("start: pair+", "start: binding+")
         cases = [ide.CorpusCase(name="ok", text="a = 1\n", tree=recorded)]
-        self.assertEqual(ide.run_corpus(self.parser(renamed), cases), (0, 1))
+        self.assertEqual(ide.run_corpus(ide.single_parser(self.parser(renamed)), cases), (0, 1))
 
 
 class TestCorpusInTheApp(IdeTestCase):
@@ -486,7 +492,7 @@ class TestCorpusInTheApp(IdeTestCase):
         view = self.app.result_pane.corpus_view
         rows = [view.tree.item(i, "values") for i in view.tree.get_children()]
         self.assertEqual([row[0] for row in rows], ["ok", "bad"])
-        self.assertEqual([row[2] for row in rows], [ide.RESULT_PASS, ide.RESULT_FAIL])
+        self.assertEqual([row[4] for row in rows], [ide.RESULT_PASS, ide.RESULT_FAIL])
         self.assertIn("1/2 passed", view.summary.cget("text"))
 
     def test_a_broken_grammar_does_not_run_the_corpus(self) -> None:
@@ -752,6 +758,451 @@ class TestGrammarImports(IdeTestCase):
         options = self.app._import_options()
         self.assertEqual(options["source_path"], str(main))
         self.assertEqual(options["import_paths"], [str(main.parent)])
+
+
+class TestFindingNodesFromTheInput(IdeTestCase):
+    """The reverse of the span highlight: from a position in the input to a tree node."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.parse(text='a = 1\nbb = "two"\n')
+
+    def label(self) -> str:
+        selection = self.app.result_pane.tree.selection()
+        return self.app.result_pane.tree.item(selection[0], "text") if selection else ""
+
+    def put_cursor(self, index: str) -> None:
+        self.app.input_pane.text.mark_set("insert", index)
+        self.app.on_input_cursor_moved()
+        self.app.update()
+
+    def select_text(self, first: str, last: str) -> None:
+        self.app.input_pane.text.tag_add("sel", first, last)
+        self.app.on_input_cursor_moved()
+        self.app.update()
+
+    def test_the_caret_in_a_token_finds_that_token(self) -> None:
+        self.put_cursor("2.0")
+        self.assertEqual(self.label(), "NAME")
+
+    def test_the_caret_in_a_value_finds_the_value(self) -> None:
+        self.put_cursor("1.4")
+        self.assertEqual(self.label(), "NUMBER")
+
+    def test_a_selection_spanning_a_whole_line_finds_the_rule(self) -> None:
+        self.select_text("2.0", "2.10")
+        self.assertEqual(self.label(), "pair")
+
+    def test_a_selection_spanning_both_lines_finds_the_root(self) -> None:
+        self.select_text("1.0", "2.10")
+        self.assertEqual(self.label(), "start")
+
+    def test_the_deepest_node_wins(self) -> None:
+        """The caret sits inside start, pair and NAME at once; NAME is the useful answer."""
+        self.put_cursor("1.0")
+        self.assertEqual(self.label(), "NAME")
+
+    def test_following_the_cursor_can_be_switched_off(self) -> None:
+        self.app.follow_cursor.set(False)
+        self.put_cursor("2.0")
+        self.assertEqual(self.label(), "")
+
+    def test_the_explicit_command_works_even_when_following_is_off(self) -> None:
+        self.app.follow_cursor.set(False)
+        self.app.input_pane.text.mark_set("insert", "2.0")
+        self.app.find_node_at_cursor()
+        self.app.update()
+        self.assertEqual(self.label(), "NAME")
+        self.assertEqual(self.app.result_pane.current_view(), ide.TREE_VIEW)
+
+    def test_the_explicit_command_refuses_a_stale_tree(self) -> None:
+        self.app.input_pane.text.insert("1.0", "zzz = 0\n")
+        self.app.find_node_at_cursor()
+        self.app.update()
+        self.assertIn("changed since the last parse", self.status())
+
+    def test_a_position_outside_every_node_selects_nothing(self) -> None:
+        self.app.input_pane.set_content("   \n")
+        self.app.parse_now()
+        self.app.update()
+        self.app.find_node_at_cursor()
+        self.app.update()
+        self.assertEqual(self.label(), "")
+
+    def test_selecting_a_node_still_highlights_back_into_the_input(self) -> None:
+        """The two directions must agree: going one way and back lands on the same text."""
+        self.put_cursor("2.0")
+        ranges = self.app.input_pane.text.tag_ranges(ide.SPAN_TAG)
+        self.assertEqual(self.app.input_pane.text.get(ranges[0], ranges[1]), "bb")
+
+
+class TestWatchingImports(IdeTestCase):
+    MAIN = 'start: pair+\npair: NAME "=" value\n%import .shared.value\n%import common.CNAME -> NAME\n%import common.WS\n%ignore WS\n'
+    NUMBERS = "value: NUMBER\n%import common.NUMBER\n"
+    STRINGS = "value: ESCAPED_STRING\n%import common.ESCAPED_STRING\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.project = self.tmp / "project"
+        self.project.mkdir(parents=True, exist_ok=True)
+        self.shared = self.project / "shared.lark"
+        self.shared.write_text(self.NUMBERS, encoding="utf-8")
+        self.main = self.project / "main.lark"
+        self.main.write_text(self.MAIN, encoding="utf-8")
+        self.app.open_recent(ide.GRAMMAR_KIND, self.main)
+        self.app.input_pane.set_content("a = 1\n")
+        self.app.parse_now()
+        self.app.update()
+
+    def touch_shared(self, text: str) -> None:
+        self.shared.write_text(text, encoding="utf-8")
+        os.utime(self.shared, (time.time() + 5, time.time() + 5))
+
+    def test_the_imported_file_is_watched(self) -> None:
+        self.assertIn(self.shared, self.app._import_mtimes)
+
+    def test_bundled_grammars_are_not_watched(self) -> None:
+        """common.lark is a package resource, not a path, so there is nothing to stat."""
+        self.assertEqual(list(self.app._import_mtimes), [self.shared])
+
+    def test_a_changed_import_triggers_a_reparse(self) -> None:
+        self.assertIn("Parsed OK", self.status())
+        self.touch_shared(self.STRINGS)
+        self.app._check_imports()
+        self.app.update()
+        self.assertIn("shared.lark changed on disk", self.status())
+        self.assertIn("Parse error", self.app.result_pane.text.get("1.0", "end"))
+
+    def test_an_unchanged_import_does_nothing(self) -> None:
+        before = self.status()
+        self.app._check_imports()
+        self.app.update()
+        self.assertEqual(self.status(), before)
+
+    def test_a_deleted_import_counts_as_a_change(self) -> None:
+        self.shared.unlink()
+        self.app._check_imports()
+        self.app.update()
+        self.assertIn("changed on disk", self.status())
+
+    def test_watching_can_be_switched_off(self) -> None:
+        self.app.watch_imports.set(False)
+        before = self.status()
+        self.touch_shared(self.STRINGS)
+        self.app._check_imports()
+        self.app.update()
+        self.assertEqual(self.status(), before)
+
+    def test_the_watch_list_follows_the_grammar(self) -> None:
+        self.app.grammar_pane.set_content('start: "a"\n')
+        self.app.parse_now()
+        self.app.update()
+        self.assertEqual(self.app._import_mtimes, {})
+
+    def test_an_unsaved_grammar_watches_nothing(self) -> None:
+        self.assertEqual(ide.LarkIde._imported_files(self.new_app()), [])
+
+
+class TestPerCaseParserOptions(IdeTestCase):
+    """A case may override the parser or the start rule it runs under."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.app.grammar_pane.set_content(GRAMMAR)
+        self.app.input_pane.set_content(INPUT)
+
+    def run_cases(self) -> tuple[int, int]:
+        return ide.run_corpus(self.app._case_parser_supplier(), self.app.corpus.cases)
+
+    def test_a_case_with_its_own_start_rule(self) -> None:
+        """'a = 1' is not a whole document, but it is a valid pair."""
+        self.app.corpus.add(ide.CorpusCase(name="fragment", text="a = 1", start="pair"))
+        self.assertEqual(self.run_cases(), (1, 1))
+
+    def test_the_same_fragment_fails_under_the_default_start_rule(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="fragment", text="a = 1", start="pair"))
+        self.app.corpus.cases[0].start = None
+        self.assertEqual(self.run_cases(), (1, 1))
+        self.app.start_rule.set("value")
+        self.assertEqual(self.run_cases(), (0, 1))
+
+    def test_a_case_with_its_own_parser(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="under lalr", text=INPUT, parser="lalr"))
+        self.assertEqual(self.run_cases(), (1, 1))
+
+    def test_an_unknown_start_rule_fails_that_case_only(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="good", text=INPUT))
+        self.app.corpus.add(ide.CorpusCase(name="bad rule", text=INPUT, start="nosuchrule"))
+        self.assertEqual(self.run_cases(), (1, 2))
+        self.assertIn("does not compile", self.app.corpus.cases[1].detail)
+        self.assertIn("start=nosuchrule", self.app.corpus.cases[1].detail)
+
+    def test_each_parser_combination_is_compiled_once(self) -> None:
+        for index in range(4):
+            self.app.corpus.add(ide.CorpusCase(name=f"c{index}", text=INPUT, parser="lalr"))
+        compiled = []
+        original = self.app._compile_grammar
+
+        def counting(*args, **kwargs):
+            compiled.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        self.app._compile_grammar = counting
+        self.run_cases()
+        self.assertEqual(len(compiled), 1)
+
+    def test_overrides_survive_a_save_and_load(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="fragment", text="a = 1", parser="lalr", start="pair"))
+        path = self.tmp / "demo.corpus.json"
+        self.app.corpus.save(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["cases"][0]["parser"], "lalr")
+        self.assertEqual(payload["cases"][0]["start"], "pair")
+
+        reloaded = ide.Corpus()
+        reloaded.load(path)
+        self.assertEqual(reloaded.cases[0].parser, "lalr")
+        self.assertEqual(reloaded.cases[0].start, "pair")
+
+    def test_a_case_without_overrides_writes_no_extra_keys(self) -> None:
+        corpus = ide.Corpus()
+        corpus.add(ide.CorpusCase(name="plain", text=INPUT))
+        path = self.tmp / "plain.corpus.json"
+        corpus.save(path)
+        self.assertEqual(set(json.loads(path.read_text(encoding="utf-8"))["cases"][0]), {"name", "input", "expect"})
+
+    def test_a_nonsense_parser_in_a_file_is_ignored(self) -> None:
+        case = ide.CorpusCase.from_dict({"name": "x", "input": "a", "parser": "packrat"})
+        self.assertIsNone(case.parser)
+
+    def test_a_blank_start_rule_in_a_file_means_inherit(self) -> None:
+        self.assertIsNone(ide.CorpusCase.from_dict({"name": "x", "input": "a", "start": "  "}).start)
+
+    def test_the_overrides_show_in_the_corpus_tab(self) -> None:
+        self.app.corpus.add(ide.CorpusCase(name="fragment", text="a = 1", parser="lalr", start="pair"))
+        self.app.run_corpus_now()
+        self.app.update()
+        view = self.app.result_pane.corpus_view
+        values = view.tree.item(view.tree.get_children()[0], "values")
+        self.assertEqual(values[2], "lalr")
+        self.assertEqual(values[3], "pair")
+
+
+class TestTokenView(IdeTestCase):
+    """The Tokens tab shows the lexer's output and the terminals behind it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.parse(text="a = 1\n")
+
+    def rows(self) -> list[tuple[str, tuple]]:
+        view = self.app.result_pane.token_view
+        return [(view.stream.item(i, "text"), view.stream.item(i, "values")) for i in view.stream.get_children()]
+
+    def terminal_rows(self) -> dict[str, tuple]:
+        view = self.app.result_pane.token_view
+        return {view.terminals.item(i, "text"): view.terminals.item(i, "values") for i in view.terminals.get_children()}
+
+    def test_the_token_stream_is_listed_in_order(self) -> None:
+        self.assertEqual([label for label, _ in self.rows()][:3], ["NAME", "WS", "EQUAL"])
+
+    def test_tokens_carry_value_and_position(self) -> None:
+        values = dict(self.rows())["NAME"]
+        self.assertEqual(values[0], "a")
+        self.assertEqual(values[1], "1:1")
+
+    def test_ignored_tokens_are_shown_but_marked(self) -> None:
+        """WS is %ignored, so the parser never sees it, but the lexer did."""
+        view = self.app.result_pane.token_view
+        whitespace = [i for i in view.stream.get_children() if view.stream.item(i, "text") == "WS"]
+        self.assertTrue(whitespace)
+        self.assertIn("ignored", view.stream.item(whitespace[0], "tags"))
+
+    def test_terminals_are_listed_with_their_use_counts(self) -> None:
+        rows = self.terminal_rows()
+        self.assertEqual(str(rows["NAME"][1]), "1")
+        self.assertIn("ESCAPED_STRING", rows)
+        self.assertEqual(str(rows["ESCAPED_STRING"][1]), "0")
+
+    def test_an_unused_terminal_is_marked(self) -> None:
+        view = self.app.result_pane.token_view
+        unused = [i for i in view.terminals.get_children() if view.terminals.item(i, "text") == "ESCAPED_STRING"]
+        self.assertIn("unused", view.terminals.item(unused[0], "tags"))
+
+    def test_a_failed_parse_still_shows_tokens(self) -> None:
+        """Lexing is separate from parsing, which is the point of the view."""
+        self.parse(text="a = = 1\n")
+        self.assertIn("Parse error", self.status())
+        self.assertIn("NAME", [label for label, _ in self.rows()])
+
+    def test_a_lexing_failure_shows_how_far_it_got(self) -> None:
+        self.parse(text="a = \u00a7\n")
+        view = self.app.result_pane.token_view
+        self.assertIn("lexing stopped", view.summary.cget("text"))
+        self.assertEqual(next(label for label, _ in self.rows()), "NAME")
+
+    def test_selecting_a_token_highlights_it_in_the_input(self) -> None:
+        view = self.app.result_pane.token_view
+        view.stream.selection_set("0")
+        self.app.update()
+        ranges = self.app.input_pane.text.tag_ranges(ide.SPAN_TAG)
+        self.assertEqual(self.app.input_pane.text.get(ranges[0], ranges[1]), "a")
+
+    def test_the_tab_is_reachable_from_the_view_menu(self) -> None:
+        self.app.result_view.set(ide.TOKEN_VIEW)
+        self.app.on_view_selected()
+        self.app.update()
+        self.assertEqual(self.app.result_pane.current_view(), ide.TOKEN_VIEW)
+
+
+AMBIGUOUS = 'start: expr\nexpr: expr "+" expr | NUM\n%import common.NUMBER -> NUM\n%import common.WS\n%ignore WS\n'
+
+
+class TestAmbiguity(IdeTestCase):
+    def test_ambiguity_is_resolved_silently_by_default(self) -> None:
+        self.parse(grammar=AMBIGUOUS, text="1 + 2 + 3")
+        self.assertIn("Parsed OK", self.status())
+        self.assertNotIn("ambiguous", self.status())
+
+    def test_explicit_ambiguity_reports_the_count(self) -> None:
+        self.app.show_ambiguity.set(True)
+        self.parse(grammar=AMBIGUOUS, text="1 + 2 + 3")
+        self.assertIn("1 ambiguous node", self.status())
+
+    def test_the_ambiguous_node_appears_in_the_tree(self) -> None:
+        self.app.show_ambiguity.set(True)
+        self.parse(grammar=AMBIGUOUS, text="1 + 2 + 3")
+        pane = self.app.result_pane
+        labels = [pane.tree.item(i, "text") for i in pane._walk()]
+        self.assertIn("_ambig (2 derivations)", labels)
+        self.assertEqual(len([label for label in labels if label.startswith("derivation ")]), 2)
+
+    def test_the_ambiguous_node_is_tagged(self) -> None:
+        self.app.show_ambiguity.set(True)
+        self.parse(grammar=AMBIGUOUS, text="1 + 2 + 3")
+        pane = self.app.result_pane
+        ambig = [i for i in pane._walk() if pane.tree.item(i, "text").startswith("_ambig")]
+        self.assertIn(ide.AMBIG_NODE, pane.tree.item(ambig[0], "tags"))
+
+    def test_an_unambiguous_input_reports_nothing(self) -> None:
+        self.app.show_ambiguity.set(True)
+        self.parse(grammar=AMBIGUOUS, text="1")
+        self.assertNotIn("ambiguous", self.status())
+
+    def test_lalr_is_not_offered_the_option(self) -> None:
+        """lalr raises a ConfigurationError if given ambiguity='explicit', so it never is."""
+        self.app.show_ambiguity.set(True)
+        self.app.parser_name.set("lalr")
+        self.assertEqual(self.app._ambiguity_options("lalr"), {})
+        self.parse(grammar=GRAMMAR)
+        self.assertIn("Parsed OK", self.status())
+
+    def test_switching_it_on_with_lalr_says_so(self) -> None:
+        self.app.parser_name.set("lalr")
+        self.app.grammar_pane.set_content(GRAMMAR)
+        self.app.show_ambiguity.set(True)
+        self.app.on_ambiguity_changed()
+        self.app.update()
+        self.assertIn("only reported by the earley parser", self.status())
+
+
+class TestRailroadDiagrams(unittest.TestCase):
+    """The SVG generator, which is a plain function and needs no window."""
+
+    SIMPLE = 'start: pair+\npair: NAME "=" value\nvalue: NUMBER | ESCAPED_STRING\nNAME: /[a-z]+/\n'
+
+    def items(self, grammar: str) -> dict:
+        return dict(railroad.grammar_items(grammar))
+
+    def test_every_rule_and_terminal_becomes_a_diagram(self) -> None:
+        self.assertEqual(list(self.items(self.SIMPLE)), ["start", "pair", "value", "NAME"])
+
+    def test_directives_are_not_diagrams(self) -> None:
+        items = self.items(self.SIMPLE + "%import common.WS\n%ignore WS\n")
+        self.assertNotIn("WS", [name for name in items if name.startswith("%")])
+        self.assertEqual(len(items), 4)
+
+    def test_a_choice_becomes_a_choice(self) -> None:
+        self.assertIsInstance(self.items(self.SIMPLE)["value"], railroad.Choice)
+
+    def test_a_sequence_becomes_a_sequence(self) -> None:
+        self.assertIsInstance(self.items(self.SIMPLE)["pair"], railroad.Sequence)
+
+    def test_plus_becomes_a_repeat(self) -> None:
+        self.assertIsInstance(self.items(self.SIMPLE)["start"], railroad.Repeat)
+
+    def test_star_becomes_an_optional_repeat(self) -> None:
+        item = self.items('start: "a"*\n')["start"]
+        self.assertIsInstance(item, railroad.Choice)
+        self.assertIsInstance(item.items[0], railroad.Repeat)
+        self.assertIsInstance(item.items[1], railroad.Skip)
+
+    def test_question_mark_becomes_an_optional(self) -> None:
+        item = self.items('start: "a"?\n')["start"]
+        self.assertIsInstance(item, railroad.Choice)
+        self.assertIsInstance(item.items[1], railroad.Skip)
+
+    def test_square_brackets_become_an_optional(self) -> None:
+        self.assertIsInstance(self.items('start: ["a"]\n')["start"], railroad.Choice)
+
+    def test_a_repetition_range_is_labelled(self) -> None:
+        item = self.items("start: DIGIT~2..4\nDIGIT: /[0-9]/\n")["start"]
+        self.assertEqual(item.label, "2 to 4")
+
+    def test_rules_and_terminals_are_drawn_differently(self) -> None:
+        """A reader needs to tell 'go look at another rule' from 'match this text'."""
+        pair = self.items(self.SIMPLE)["pair"]
+        boxes = {item.text: item.is_rule for item in pair.items}
+        self.assertFalse(boxes["NAME"])
+        self.assertTrue(boxes["value"])
+
+    def test_an_alias_does_not_change_the_shape(self) -> None:
+        item = self.items('start: "a" -> named\n')["start"]
+        self.assertIsInstance(item, railroad.Leaf)
+
+    def test_sizes_are_positive_and_nest(self) -> None:
+        outer = self.items(self.SIMPLE)["pair"]
+        self.assertGreater(outer.width, max(child.width for child in outer.items))
+        self.assertGreater(outer.up + outer.down, 0)
+
+    def test_the_document_is_well_formed_svg(self) -> None:
+        svg = railroad.grammar_svg(self.SIMPLE)
+        parsed = ElementTree.fromstring(svg)
+        self.assertTrue(parsed.tag.endswith("svg"))
+        self.assertGreater(int(float(parsed.get("width"))), 0)
+        self.assertGreater(int(float(parsed.get("height"))), 0)
+
+    def test_every_rule_name_appears_as_a_title(self) -> None:
+        svg = railroad.grammar_svg(self.SIMPLE)
+        for name in ("start", "pair", "value", "NAME"):
+            self.assertIn(f">{name}<", svg)
+
+    def test_text_is_escaped(self) -> None:
+        svg = railroad.grammar_svg('start: "<&>"\n')
+        self.assertNotIn('>"<&>"<', svg)
+        self.assertIn("&amp;", svg)
+
+    def test_an_empty_grammar_still_produces_a_document(self) -> None:
+        self.assertIn("<svg", railroad.grammar_svg("\n"))
+
+    def test_a_broken_grammar_raises(self) -> None:
+        with self.assertRaises(lark.exceptions.LarkError):
+            railroad.grammar_svg("start: (((\n")
+
+
+class TestRailroadExport(IdeTestCase):
+    def test_exporting_writes_a_file(self) -> None:
+        self.app.grammar_pane.set_content(GRAMMAR)
+        target = self.tmp / "grammar.svg"
+        self.assertTrue(self.app.write_railroad(target, railroad.grammar_svg(GRAMMAR)))
+        self.assertIn("<svg", target.read_text(encoding="utf-8"))
+        self.assertIn("written to grammar.svg", self.status())
+
+    def test_an_empty_grammar_is_refused(self) -> None:
+        self.app.grammar_pane.set_content("   ")
+        self.app.export_railroad()
+        self.app.update()
+        self.assertIn("no grammar to draw", self.status())
 
 
 if __name__ == "__main__":

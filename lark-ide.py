@@ -23,9 +23,16 @@ from tkinter.scrolledtext import ScrolledText
 try:
     import lark
     from lark import exceptions as lark_exceptions
+    from lark.load_grammar import list_grammar_imports
 except ImportError:  # pragma: no cover - exercised only when lark is absent
     lark = None
     lark_exceptions = None
+    list_grammar_imports = None
+
+try:
+    import lark_railroad
+except ImportError:  # pragma: no cover - the diagram module is optional
+    lark_railroad = None
 
 APP_NAME = "lark-ide"
 WINDOW_GEOMETRY = "1400x850"
@@ -54,8 +61,9 @@ INPUT_KIND = "input"
 
 TEXT_VIEW = "text"
 TREE_VIEW = "tree"
+TOKEN_VIEW = "tokens"
 CORPUS_VIEW = "corpus"
-VIEW_ORDER = (TEXT_VIEW, TREE_VIEW, CORPUS_VIEW)
+VIEW_ORDER = (TEXT_VIEW, TREE_VIEW, TOKEN_VIEW, CORPUS_VIEW)
 MAX_TREE_NODES = 20000
 MAX_TREE_VALUE_CHARS = 80
 
@@ -68,8 +76,14 @@ RESULT_UNKNOWN = ""
 RESULT_PASS = "pass"
 RESULT_FAIL = "fail"
 PASS_COLOUR = "#1b5e20"
+IGNORED_COLOUR = "#999999"
+AMBIG_COLOUR = "#b26a00"
+AMBIG_NODE = "_ambig"
+SVG_FILETYPES = [("SVG images", "*.svg"), ("All files", "*.*")]
+MAX_TOKENS = 5000
 
 HIGHLIGHT_DELAY_MS = 150
+WATCH_INTERVAL_MS = 1000
 SYNTAX_COLOURS = {
     "comment": "#6a737d",
     "directive": "#a626a4",
@@ -167,24 +181,31 @@ class CorpusCase:
     text: str
     expect: str = EXPECT_PARSE
     tree: str | None = None
+    parser: str | None = None
+    start: str | None = None
     result: str = field(default=RESULT_UNKNOWN, compare=False)
     detail: str = field(default="", compare=False)
 
     def to_dict(self) -> dict:
         data = {"name": self.name, "input": self.text, "expect": self.expect}
-        if self.tree is not None:
-            data["tree"] = self.tree
+        for key, value in (("tree", self.tree), ("parser", self.parser), ("start", self.start)):
+            if value is not None:
+                data[key] = value
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> CorpusCase:
         expect = data.get("expect", EXPECT_PARSE)
         tree = data.get("tree")
+        parser = data.get("parser")
+        start = data.get("start")
         return cls(
             name=str(data.get("name", "unnamed")),
             text=str(data.get("input", "")),
             expect=expect if expect in (EXPECT_PARSE, EXPECT_ERROR) else EXPECT_PARSE,
             tree=str(tree) if isinstance(tree, str) else None,
+            parser=parser if parser in PARSERS else None,
+            start=str(start) if isinstance(start, str) and start.strip() else None,
         )
 
 
@@ -245,6 +266,14 @@ class Corpus:
         return wanted
 
 
+def _mtime(path: Path) -> int:
+    """The file's modification time, or -1 when it is missing, so appearing and vanishing both count."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
 def node_span(node: object) -> tuple[int, int, int, int] | None:
     """The (line, column, end_line, end_column) a tree or token covers, or None when unknown."""
     meta = getattr(node, "meta", None)
@@ -257,10 +286,26 @@ def node_span(node: object) -> tuple[int, int, int, int] | None:
     return line, node.column, end_line, node.end_column
 
 
-def run_corpus(parser: object, cases: list[CorpusCase]) -> tuple[int, int]:
-    """Run every case against a compiled parser, recording the outcome on each. Returns (passed, total)."""
+ParserSupplier = Callable[[CorpusCase], "tuple[object | None, str]"]
+
+
+def single_parser(parser: object) -> ParserSupplier:
+    """A supplier that hands the same parser to every case."""
+    return lambda _case: (parser, "")
+
+
+def run_corpus(get_parser: ParserSupplier, cases: list[CorpusCase]) -> tuple[int, int]:
+    """Run every case against the parser its supplier returns. Returns (passed, total).
+
+    A case may ask for its own parser or start rule, so the parser is looked up per case rather
+    than passed in once.
+    """
     passed = 0
     for case in cases:
+        parser, problem = get_parser(case)
+        if parser is None:
+            case.result, case.detail = RESULT_FAIL, problem or "no parser for this case"
+            continue
         case.result, case.detail = _run_case(parser, case)
         if case.result == RESULT_PASS:
             passed += 1
@@ -383,6 +428,20 @@ class EditorPane(ttk.Frame):
     def clear_error(self) -> None:
         self.text.tag_remove(ERROR_TAG, "1.0", "end")
 
+    def cursor_position(self) -> tuple[int, int]:
+        """The caret as lark reports positions: 1-based line and column."""
+        line, column = self.text.index("insert").split(".")
+        return int(line), int(column) + 1
+
+    def selection_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        try:
+            first, last = self.text.index("sel.first"), self.text.index("sel.last")
+        except tk.TclError:
+            return None
+        start_line, start_column = first.split(".")
+        end_line, end_column = last.split(".")
+        return (int(start_line), int(start_column) + 1), (int(end_line), int(end_column) + 1)
+
     def clear_span(self) -> None:
         self.text.tag_remove(SPAN_TAG, "1.0", "end")
 
@@ -484,6 +543,136 @@ class EditorPane(ttk.Frame):
         return self.save() if answer else True
 
 
+class TokenView(ttk.Frame):
+    """The Tokens tab: what the lexer produced, and which terminals exist."""
+
+    def __init__(self, master: tk.Misc, on_token_selected: Callable[[int], None]) -> None:
+        super().__init__(master)
+        self.on_token_selected = on_token_selected
+        self.tokens: list[object] = []
+
+        self.summary = ttk.Label(self, anchor="w", padding=(4, 3), text="Not lexed yet")
+        self.summary.pack(fill="x")
+
+        split = ttk.PanedWindow(self, orient="vertical")
+        split.pack(fill="both", expand=True)
+        split.add(self._build_stream(split), weight=3)
+        split.add(self._build_terminals(split), weight=2)
+
+    def _build_stream(self, master: tk.Misc) -> ttk.Frame:
+        frame = ttk.Frame(master)
+        self.stream = ttk.Treeview(frame, columns=("value", "pos"), selectmode="browse")
+        self.stream.heading("#0", text="Token", anchor="w")
+        self.stream.heading("value", text="Value", anchor="w")
+        self.stream.heading("pos", text="Line:Col", anchor="e")
+        self.stream.column("#0", width=170, minwidth=80, stretch=False)
+        self.stream.column("value", width=220, minwidth=80, stretch=True)
+        self.stream.column("pos", width=80, minwidth=60, stretch=False, anchor="e")
+        self.stream.tag_configure("ignored", foreground=IGNORED_COLOUR)
+        self._with_scrollbars(frame, self.stream)
+        self.stream.bind("<<TreeviewSelect>>", self._on_select)
+        return frame
+
+    def _build_terminals(self, master: tk.Misc) -> ttk.Frame:
+        frame = ttk.Frame(master)
+        self.terminals = ttk.Treeview(frame, columns=("priority", "uses", "pattern"), show="headings")
+        for column, heading, width, stretch in (
+            ("priority", "Priority", 65, False),
+            ("uses", "Uses", 55, False),
+            ("pattern", "Pattern", 300, True),
+        ):
+            self.terminals.heading(column, text=heading, anchor="w")
+            self.terminals.column(column, width=width, minwidth=45, stretch=stretch)
+        self.terminals["displaycolumns"] = ("priority", "uses", "pattern")
+        self.terminals.configure(show="tree headings")
+        self.terminals.heading("#0", text="Terminal", anchor="w")
+        self.terminals.column("#0", width=170, minwidth=80, stretch=False)
+        self.terminals.tag_configure("unused", foreground=IGNORED_COLOUR)
+        self._with_scrollbars(frame, self.terminals)
+        return frame
+
+    @staticmethod
+    def _with_scrollbars(frame: ttk.Frame, widget: ttk.Treeview) -> None:
+        vbar = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+        hbar = ttk.Scrollbar(frame, orient="horizontal", command=widget.xview)
+        widget.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        widget.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+    def show(self, tokens: list, terminals: list, ignored: set[str], problem: str) -> None:
+        self.tokens = tokens[:MAX_TOKENS]
+        self.stream.delete(*self.stream.get_children())
+        for index, token in enumerate(self.tokens):
+            name = str(getattr(token, "type", "?"))
+            self.stream.insert(
+                "",
+                "end",
+                iid=str(index),
+                text=name,
+                values=(_display_value(str(token)), f"{token.line}:{token.column}"),
+                tags=("ignored",) if name in ignored else (),
+            )
+        self._show_terminals(terminals, ignored)
+        self.summary.configure(text=self._describe(tokens, problem))
+
+    def _show_terminals(self, terminals: list, ignored: set[str]) -> None:
+        counts: dict[str, int] = {}
+        for token in self.tokens:
+            name = str(getattr(token, "type", "?"))
+            counts[name] = counts.get(name, 0) + 1
+        self.terminals.delete(*self.terminals.get_children())
+        for definition in sorted(terminals, key=lambda item: item.name):
+            uses = counts.get(definition.name, 0)
+            tags = []
+            if definition.name in ignored:
+                tags.append("ignored")
+            elif not uses:
+                tags.append("unused")
+            self.terminals.insert(
+                "",
+                "end",
+                text=definition.name,
+                values=(definition.priority, uses, _display_value(_pattern_text(definition))),
+                tags=tuple(tags),
+            )
+
+    def _describe(self, tokens: list, problem: str) -> str:
+        shown = len(self.tokens)
+        parts = [f"{shown} tokens" if shown != 1 else "1 token"]
+        if len(tokens) > shown:
+            parts[0] += f" (of {len(tokens)}, truncated)"
+        if problem:
+            parts.append(f"lexing stopped: {problem}")
+        return " - ".join(parts)
+
+    def clear(self) -> None:
+        self.tokens = []
+        self.stream.delete(*self.stream.get_children())
+        self.terminals.delete(*self.terminals.get_children())
+        self.summary.configure(text="Not lexed yet")
+
+    def _on_select(self, _event: tk.Event) -> None:
+        selection = self.stream.selection()
+        if selection:
+            self.on_token_selected(int(selection[0]))
+
+
+def _pattern_text(definition: object) -> str:
+    pattern = definition.pattern
+    raw = getattr(pattern, "raw", None)
+    return str(raw) if raw else pattern.to_regexp()
+
+
+def _display_value(text: str) -> str:
+    shown = text.replace("\n", "\\n").replace("\t", "\\t")
+    if len(shown) > MAX_TREE_VALUE_CHARS:
+        shown = shown[: MAX_TREE_VALUE_CHARS - 3] + "..."
+    return shown
+
+
 class CorpusView(ttk.Frame):
     """The Corpus tab: every case with its last result."""
 
@@ -496,17 +685,18 @@ class CorpusView(ttk.Frame):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(body, columns=("expect", "result", "detail"), show="headings", selectmode="browse")
+        columns = ("name", "expect", "parser", "start", "result", "detail")
+        self.tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
         for column, heading, width in (
-            ("expect", "Expect", 70),
-            ("result", "Result", 70),
-            ("detail", "Detail", 240),
+            ("name", "Case", 160),
+            ("expect", "Expect", 65),
+            ("parser", "Parser", 65),
+            ("start", "Start", 70),
+            ("result", "Result", 60),
+            ("detail", "Detail", 220),
         ):
             self.tree.heading(column, text=heading, anchor="w")
-            self.tree.column(column, width=width, minwidth=60, stretch=column == "detail")
-        self.tree["columns"] = ("name", "expect", "result", "detail")
-        self.tree.heading("name", text="Case", anchor="w")
-        self.tree.column("name", width=180, minwidth=80, stretch=True)
+            self.tree.column(column, width=width, minwidth=50, stretch=column in ("name", "detail"))
         self.tree.tag_configure(RESULT_PASS, foreground=PASS_COLOUR)
         self.tree.tag_configure(RESULT_FAIL, foreground=ERROR_COLOUR)
 
@@ -529,7 +719,14 @@ class CorpusView(ttk.Frame):
                 "",
                 "end",
                 iid=str(index),
-                values=(case.name, case.expect, case.result, case.detail),
+                values=(
+                    case.name,
+                    case.expect,
+                    case.parser or "",
+                    case.start or "",
+                    case.result,
+                    case.detail,
+                ),
                 tags=(case.result,) if case.result else (),
             )
         if selected is not None and 0 <= selected < len(corpus.cases):
@@ -560,6 +757,7 @@ class ResultPane(ttk.Frame):
         on_view_change: Callable[[], None],
         on_open_case: Callable[[int], None],
         on_node_selected: Callable[[object | None], None],
+        on_token_selected: Callable[[int], None],
     ) -> None:
         super().__init__(master)
         self.base_title = title
@@ -575,6 +773,8 @@ class ResultPane(ttk.Frame):
         self.notebook.pack(fill="both", expand=True)
         self.notebook.add(self._build_text_view(editor_font), text="Text")
         self.notebook.add(self._build_tree_view(), text="Tree")
+        self.token_view = TokenView(self.notebook, on_token_selected)
+        self.notebook.add(self.token_view, text="Tokens")
         self.corpus_view = CorpusView(self.notebook, on_open_case)
         self.notebook.add(self.corpus_view, text="Corpus")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self.on_view_change())
@@ -606,6 +806,7 @@ class ResultPane(ttk.Frame):
         self.tree.column("#0", width=240, minwidth=120, stretch=True)
         self.tree.column("value", width=200, minwidth=80, stretch=True)
         self.tree.column("pos", width=80, minwidth=60, stretch=False, anchor="e")
+        self.tree.tag_configure(AMBIG_NODE, foreground=AMBIG_COLOUR)
 
         vbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         hbar = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
@@ -621,6 +822,34 @@ class ResultPane(ttk.Frame):
         self.tree.bind("<Button-3>", self._on_context_menu)
         self.tree.bind("<Button-2>", self._on_context_menu)
         return frame
+
+    def item_at(self, start: tuple[int, int], end: tuple[int, int] | None = None) -> str | None:
+        """The deepest tree item whose span covers the given position or range, if any."""
+        target_end = end or start
+        found: str | None = None
+        parent = ""
+        while True:
+            for item in self.tree.get_children(parent):
+                span = node_span(self.nodes.get(item))
+                if span is not None and span[:2] <= start and target_end <= span[2:]:
+                    found, parent = item, item
+                    break
+            else:
+                return found
+
+    def reveal(self, item: str) -> None:
+        for ancestor in self._ancestors(item):
+            self.tree.item(ancestor, open=True)
+        self.tree.selection_set(item)
+        self.tree.see(item)
+
+    def _ancestors(self, item: str) -> list[str]:
+        chain = []
+        parent = self.tree.parent(item)
+        while parent:
+            chain.append(parent)
+            parent = self.tree.parent(parent)
+        return chain
 
     def _on_tree_select(self, _event: tk.Event) -> None:
         selection = self.tree.selection()
@@ -653,6 +882,7 @@ class ResultPane(ttk.Frame):
         self.pretty = ""
         self._set_text("", is_error=False)
         self._clear_tree()
+        self.token_view.clear()
 
     def _set_text(self, value: str, is_error: bool) -> None:
         self.text.configure(state="normal")
@@ -675,7 +905,7 @@ class ResultPane(ttk.Frame):
         self.expand_all()
         return complete
 
-    def _insert_node(self, parent: str, node: object, counter: list[int]) -> bool:
+    def _insert_node(self, parent: str, node: object, counter: list[int], prefix: str = "") -> bool:
         if counter[0] >= MAX_TREE_NODES:
             return False
         counter[0] += 1
@@ -684,10 +914,16 @@ class ResultPane(ttk.Frame):
             label, value, position = self._describe_token(node)
         else:
             label, value, position = self._describe_rule(node)
-        item = self.tree.insert(parent, "end", text=label, values=(value, position))
+        ambiguous = label == AMBIG_NODE
+        if ambiguous:
+            label = f"{AMBIG_NODE} ({len(children)} derivations)"
+        item = self.tree.insert(
+            parent, "end", text=prefix + label, values=(value, position), tags=(AMBIG_NODE,) if ambiguous else ()
+        )
         self.nodes[item] = node
-        for child in children or ():
-            if not self._insert_node(item, child, counter):
+        for index, child in enumerate(children or (), start=1):
+            child_prefix = f"derivation {index}: " if ambiguous else ""
+            if not self._insert_node(item, child, counter, child_prefix):
                 return False
         return True
 
@@ -798,6 +1034,9 @@ class LarkIde(tk.Tk):
         self.start_rule = tk.StringVar(value=self.settings.get("start_rule", DEFAULT_START_RULE))
         self.result_view = tk.StringVar(value=self.settings.get("result_view", TEXT_VIEW))
         self.run_corpus_on_parse = tk.BooleanVar(value=self.settings.get("run_corpus_on_parse", True))
+        self.watch_imports = tk.BooleanVar(value=self.settings.get("watch_imports", True))
+        self.follow_cursor = tk.BooleanVar(value=self.settings.get("follow_cursor", True))
+        self.show_ambiguity = tk.BooleanVar(value=self.settings.get("show_ambiguity", False))
         self.corpus = Corpus()
         self._corpus_summary = ""
         self._last_parse_succeeded = False
@@ -805,6 +1044,9 @@ class LarkIde(tk.Tk):
         self._parse_job: str | None = None
         self._highlight_job: str | None = None
         self._restore_job: str | None = None
+        self._watch_job: str | None = None
+        self._import_key: tuple | None = None
+        self._import_mtimes: dict[Path, int] = {}
 
         self._build_body()
         self._build_menu()
@@ -813,6 +1055,7 @@ class LarkIde(tk.Tk):
         self.result_pane.select_view(self.result_view.get())
         self.refresh_corpus_view("no cases")
         self._restore_job = self.after(120, self._restore_sashes)
+        self._watch_job = self.after(WATCH_INTERVAL_MS, self._check_imports)
         self._refresh_parser_badge()
         self.status.set_message("Ready" if lark else "The 'lark' package is not installed", is_error=lark is None)
 
@@ -835,6 +1078,7 @@ class LarkIde(tk.Tk):
             self.on_view_changed,
             self.open_corpus_case,
             self.on_node_selected,
+            self.on_token_selected,
         )
         self.highlighter = GrammarHighlighter(self.grammar_pane.text)
 
@@ -874,6 +1118,7 @@ class LarkIde(tk.Tk):
         file_menu.add_cascade(label="Recent Grammars", menu=self.recent_menus[GRAMMAR_KIND])
         file_menu.add_command(label="Save Grammar", accelerator="Ctrl+S", command=self.save_grammar)
         file_menu.add_command(label="Save Grammar As...", command=self.save_grammar_as)
+        file_menu.add_command(label="Export Railroad SVG...", command=self.export_railroad)
         file_menu.add_separator()
         file_menu.add_command(label="New Input", command=self.input_pane.new_file)
         file_menu.add_command(label="Open Input...", accelerator="Ctrl+Shift+O", command=self.open_input)
@@ -901,6 +1146,13 @@ class LarkIde(tk.Tk):
             )
         parse_menu.add_separator()
         parse_menu.add_command(label="Set Start Rule...", command=self.ask_start_rule)
+        parse_menu.add_separator()
+        parse_menu.add_checkbutton(
+            label="Show Ambiguity (earley only)", variable=self.show_ambiguity, command=self.on_ambiguity_changed
+        )
+        parse_menu.add_checkbutton(
+            label="Watch Imported Files", variable=self.watch_imports, command=self.on_watch_imports_changed
+        )
         menubar.add_cascade(label="Parse", menu=parse_menu)
 
         corpus_menu = tk.Menu(menubar, tearoff=False)
@@ -913,6 +1165,8 @@ class LarkIde(tk.Tk):
         corpus_menu.add_command(label="Add Input as Error Case...", command=self.add_error_case)
         corpus_menu.add_command(label="Record Expected Tree", command=self.record_expected_tree)
         corpus_menu.add_command(label="Clear Expected Tree", command=self.clear_expected_tree)
+        corpus_menu.add_command(label="Set Case Parser...", command=self.ask_case_parser)
+        corpus_menu.add_command(label="Set Case Start Rule...", command=self.ask_case_start_rule)
         corpus_menu.add_command(label="Delete Case", command=self.delete_case)
         corpus_menu.add_separator()
         corpus_menu.add_command(label="Run Corpus", accelerator="F6", command=self.run_corpus_now)
@@ -929,8 +1183,16 @@ class LarkIde(tk.Tk):
             label="Tree View", value=TREE_VIEW, variable=self.result_view, command=self.on_view_selected
         )
         view_menu.add_radiobutton(
+            label="Tokens View", value=TOKEN_VIEW, variable=self.result_view, command=self.on_view_selected
+        )
+        view_menu.add_radiobutton(
             label="Corpus View", value=CORPUS_VIEW, variable=self.result_view, command=self.on_view_selected
         )
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Follow Cursor in Tree", variable=self.follow_cursor, command=self.on_follow_cursor_changed
+        )
+        view_menu.add_command(label="Find Node at Cursor", accelerator="F7", command=self.find_node_at_cursor)
         view_menu.add_separator()
         view_menu.add_command(label="Expand All", command=self.result_pane.expand_all)
         view_menu.add_command(label="Collapse All", command=self.result_pane.collapse_all)
@@ -952,6 +1214,9 @@ class LarkIde(tk.Tk):
         self.bind_all("<Control-q>", lambda _event: self.on_quit())
         self.bind_all("<F5>", lambda _event: self.parse_now())
         self.bind_all("<F6>", lambda _event: self.run_corpus_now())
+        self.bind_all("<F7>", lambda _event: self.find_node_at_cursor())
+        self.input_pane.text.bind("<ButtonRelease-1>", self.on_input_cursor_moved)
+        self.input_pane.text.bind("<KeyRelease>", self.on_input_cursor_moved)
 
     # -- commands --------------------------------------------------------------------------------
 
@@ -1169,7 +1434,7 @@ class LarkIde(tk.Tk):
             self.refresh_corpus_view("not run, the grammar does not compile")
             self.status.set_detail("")
             return
-        passed, total = run_corpus(parser, self.corpus.cases)
+        passed, total = run_corpus(self._case_parser_supplier(), self.corpus.cases)
         self._show_corpus(self._describe_corpus(passed, total), is_error=passed < total)
 
     @staticmethod
@@ -1250,10 +1515,10 @@ class LarkIde(tk.Tk):
 
     def destroy(self) -> None:
         """Cancel anything still pending so no callback runs against a dead window."""
-        for job in (self._parse_job, self._highlight_job, self._restore_job):
+        for job in (self._parse_job, self._highlight_job, self._restore_job, self._watch_job):
             if job is not None:
                 self.after_cancel(job)
-        self._parse_job = self._highlight_job = self._restore_job = None
+        self._parse_job = self._highlight_job = self._restore_job = self._watch_job = None
         super().destroy()
 
     def _store_layout(self) -> None:
@@ -1284,7 +1549,9 @@ class LarkIde(tk.Tk):
         if self.auto_parse.get():
             self._parse_job = self.after(AUTO_PARSE_DELAY_MS, self.parse_now)
 
-    def _compile_grammar(self) -> tuple[object | None, tuple[str, str] | None]:
+    def _compile_grammar(
+        self, parser_name: str | None = None, start: str | None = None
+    ) -> tuple[object | None, tuple[str, str] | None]:
         """Compile the grammar pane. Returns (parser, problem); both are None for an empty grammar."""
         if lark is None:
             return None, ("The 'lark' package is not installed.\n\n    pip install lark", "lark is not installed")
@@ -1294,9 +1561,10 @@ class LarkIde(tk.Tk):
         try:
             parser = lark.Lark(
                 grammar,
-                parser=self.parser_name.get(),
-                start=self.start_rule.get(),
+                parser=parser_name or self.parser_name.get(),
+                start=start or self.start_rule.get(),
                 propagate_positions=True,
+                **self._ambiguity_options(parser_name or self.parser_name.get()),
                 **self._import_options(),
             )
         except lark_exceptions.LarkError as exc:
@@ -1347,14 +1615,17 @@ class LarkIde(tk.Tk):
                 self._report_error(*problem)
             return
 
+        self._refresh_import_watch()
+        source = self.input_pane.content()
+        self._refresh_tokens(parser, source)
+
         if self.run_corpus_on_parse.get():
-            passed, total = run_corpus(parser, self.corpus.cases)
+            passed, total = run_corpus(self._case_parser_supplier(), self.corpus.cases)
             self._show_corpus(self._describe_corpus(passed, total), is_error=passed < total)
         else:
             self._corpus_summary = ""
             self.status.set_detail("")
 
-        source = self.input_pane.content()
         try:
             tree = parser.parse(source)
         except lark_exceptions.UnexpectedInput as exc:
@@ -1368,6 +1639,9 @@ class LarkIde(tk.Tk):
         node_count = sum(1 for _ in tree.iter_subtrees())
         complete = self.result_pane.show_tree(tree, tree.pretty())
         suffix = "" if complete else f" (tree view truncated at {MAX_TREE_NODES} nodes)"
+        ambiguous = sum(1 for subtree in tree.iter_subtrees() if subtree.data == AMBIG_NODE)
+        if ambiguous:
+            suffix += f", {ambiguous} ambiguous {'node' if ambiguous == 1 else 'nodes'}"
         self._last_parse_succeeded = True
         self._parsed_source = source
         self._status(f"Parsed OK - {node_count} nodes in {elapsed_ms:.0f} ms{suffix}")
@@ -1390,6 +1664,206 @@ class LarkIde(tk.Tk):
 
     def _status(self, message: str, is_error: bool = False) -> None:
         self.status.set_message(message, is_error=is_error)
+
+    def _ambiguity_options(self, parser_name: str) -> dict:
+        """Explicit ambiguity is an Earley feature; lalr rejects the option outright."""
+        if self.show_ambiguity.get() and parser_name == "earley":
+            return {"ambiguity": "explicit"}
+        return {}
+
+    def on_ambiguity_changed(self) -> None:
+        self.settings.set("show_ambiguity", self.show_ambiguity.get())
+        self.settings.save()
+        self.parse_now()
+        # After the parse, or the parse result would overwrite the warning immediately.
+        if self.show_ambiguity.get() and self.parser_name.get() != "earley":
+            self._status("Ambiguity is only reported by the earley parser", is_error=True)
+
+    # -- tokens ------------------------------------------------------------------------------------
+
+    def _refresh_tokens(self, parser: object, source: str) -> None:
+        """Lex the input separately from parsing, so a failed parse still shows how far the lexer got."""
+        tokens: list = []
+        problem = ""
+        try:
+            for token in parser.lex(source, dont_ignore=True):
+                tokens.append(token)  # noqa: PERF402 - list() would discard the tokens read before a failure
+        except lark_exceptions.LarkError as exc:
+            problem = str(exc).splitlines()[0]
+        except Exception as exc:  # noqa: BLE001 - some grammars have no standalone lexer at all
+            problem = f"{type(exc).__name__}: {exc}"
+        ignored = set(getattr(parser, "ignore_tokens", ()) or ())
+        self.result_pane.token_view.show(tokens, list(parser.terminals), ignored, problem)
+
+    def on_token_selected(self, index: int) -> None:
+        tokens = self.result_pane.token_view.tokens
+        if not 0 <= index < len(tokens) or self.input_pane.content() != self._parsed_source:
+            return
+        span = node_span(tokens[index])
+        if span is not None:
+            self.input_pane.highlight_span(span)
+
+    # -- railroad diagrams ---------------------------------------------------------------------------
+
+    def export_railroad(self) -> None:
+        if lark_railroad is None:
+            messagebox.showerror(APP_NAME, "lark_railroad.py is not next to the application.", parent=self)
+            return
+        grammar = self.grammar_pane.content()
+        if not grammar.strip():
+            self._status("There is no grammar to draw", is_error=True)
+            return
+        try:
+            svg = lark_railroad.grammar_svg(grammar)
+        except Exception as exc:  # noqa: BLE001 - an unparseable grammar cannot be drawn
+            messagebox.showerror(APP_NAME, f"Cannot draw this grammar:\n\n{exc}", parent=self)
+            return
+        suggested = self.grammar_pane.path.with_suffix(".svg") if self.grammar_pane.path else None
+        chosen = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export railroad diagram",
+            filetypes=SVG_FILETYPES,
+            defaultextension=".svg",
+            initialfile=suggested.name if suggested else "grammar.svg",
+            initialdir=str(suggested.parent) if suggested else None,
+        )
+        if chosen:
+            self.write_railroad(Path(chosen), svg)
+
+    def write_railroad(self, path: Path, svg: str) -> bool:
+        try:
+            path.write_text(svg, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Cannot write {path}:\n{exc}", parent=self)
+            return False
+        self._status(f"Railroad diagram written to {path.name}")
+        return True
+
+    # -- imported grammar files ------------------------------------------------------------------
+
+    def _imported_files(self) -> list[Path]:
+        """The on-disk grammars this one imports, recursively. Bundled grammars are not files."""
+        options = self._import_options()
+        if list_grammar_imports is None or not options:
+            return []
+        try:
+            found = list_grammar_imports(self.grammar_pane.content(), import_paths=options["import_paths"])
+        except Exception:  # noqa: BLE001 - an unparseable grammar simply has no known imports yet
+            return []
+        return [Path(entry) for entry in found if isinstance(entry, str)]
+
+    def _refresh_import_watch(self) -> None:
+        """Rebuild the watch list, but only when the grammar text or its path actually changed."""
+        key = (str(self.grammar_pane.path), self.grammar_pane.content())
+        if key == self._import_key:
+            return
+        self._import_key = key
+        self._import_mtimes = {path: _mtime(path) for path in self._imported_files()}
+
+    def _changed_imports(self) -> list[Path]:
+        changed = []
+        for path, previous in self._import_mtimes.items():
+            current = _mtime(path)
+            if current != previous:
+                self._import_mtimes[path] = current
+                changed.append(path)
+        return changed
+
+    def _check_imports(self) -> None:
+        self._watch_job = None
+        if self.watch_imports.get():
+            changed = self._changed_imports()
+            if changed:
+                names = ", ".join(sorted(path.name for path in changed))
+                self.parse_now()
+                self._status(f"Reparsed: {names} changed on disk")
+        self._watch_job = self.after(WATCH_INTERVAL_MS, self._check_imports)
+
+    def on_watch_imports_changed(self) -> None:
+        self.settings.set("watch_imports", self.watch_imports.get())
+        self.settings.save()
+
+    # -- finding a node from the input -------------------------------------------------------------
+
+    def on_follow_cursor_changed(self) -> None:
+        self.settings.set("follow_cursor", self.follow_cursor.get())
+        self.settings.save()
+
+    def on_input_cursor_moved(self, _event: tk.Event | None = None) -> None:
+        if self.follow_cursor.get():
+            self._select_node_for_cursor(reveal_view=False, announce=False)
+
+    def find_node_at_cursor(self) -> None:
+        self._select_node_for_cursor(reveal_view=True, announce=True)
+
+    def _select_node_for_cursor(self, reveal_view: bool, announce: bool) -> None:
+        """Select the deepest tree node covering the caret, or the whole selection if there is one."""
+        if self.input_pane.content() != self._parsed_source:
+            if announce:
+                self._status("The input has changed since the last parse, so there is no tree to search", True)
+            return
+        selection = self.input_pane.selection_range()
+        start, end = selection if selection else (self.input_pane.cursor_position(), None)
+        item = self.result_pane.item_at(start, end)
+        if item is None:
+            if announce:
+                self._status("No parse tree node covers that position")
+            return
+        if reveal_view:
+            self.result_pane.select_view(TREE_VIEW)
+        self.result_pane.reveal(item)
+
+    # -- per-case parser options --------------------------------------------------------------------
+
+    def _case_parser_supplier(self) -> ParserSupplier:
+        """Compile once per distinct (parser, start rule) a case asks for, and reuse it."""
+        cache: dict[tuple[str, str], tuple[object | None, str]] = {}
+
+        def supply(case: CorpusCase) -> tuple[object | None, str]:
+            key = (case.parser or self.parser_name.get(), case.start or self.start_rule.get())
+            if key not in cache:
+                parser, problem = self._compile_grammar(parser_name=key[0], start=key[1])
+                detail = "" if problem is None else f"grammar does not compile with parser={key[0]} start={key[1]}"
+                cache[key] = (parser, detail or "the grammar is empty")
+            return cache[key]
+
+        return supply
+
+    def ask_case_parser(self) -> None:
+        case = self.selected_case()
+        if case is None:
+            return
+        answer = simpledialog.askstring(
+            APP_NAME,
+            f"Parser for this case ({' or '.join(PARSERS)}), or blank to use the current one:",
+            initialvalue=case.parser or "",
+            parent=self,
+        )
+        if answer is None:
+            return
+        chosen = answer.strip().lower()
+        if chosen and chosen not in PARSERS:
+            self._status(f"'{chosen}' is not a parser; expected {' or '.join(PARSERS)}", is_error=True)
+            return
+        case.parser = chosen or None
+        self.corpus.dirty = True
+        self.run_corpus_now()
+
+    def ask_case_start_rule(self) -> None:
+        case = self.selected_case()
+        if case is None:
+            return
+        answer = simpledialog.askstring(
+            APP_NAME,
+            "Start rule for this case, or blank to use the current one:",
+            initialvalue=case.start or "",
+            parent=self,
+        )
+        if answer is None:
+            return
+        case.start = answer.strip() or None
+        self.corpus.dirty = True
+        self.run_corpus_now()
 
     def _refresh_parser_badge(self) -> None:
         self.grammar_pane.set_badge(f"parser: {self.parser_name.get()}   start: {self.start_rule.get()}")

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "test-input",
+      "input": "A: f1 T: t1 { V: v1 }\nA: f2\nA: f3\nA: f4(f2, f3)\n\nV: v2\nV: v3\nV: v4\nV: v5\n\nE: tt1 { A: vvv , }\nE: tt2\nE: tt3(tt1,tt2) {\n    V: jjj\n}",
+      "expect": "parse",
+      "tree": "lines\n  line\n    attrib\n      f1\n      atype\tt1\n      validators\n        validator\tv1\n  line\n    attrib\tf2\n  line\n    attrib\tf3\n  line\n    attrib\n      f4\n      attrib_names\n        attrib_name\tf2\n        attrib_name\tf3\n  line\n    validator\tv2\n  line\n    validator\tv3\n  line\n    validator\tv4\n  line\n    validator\tv5\n  line\n    entity\n      tt1\n      attribs\n        attrib\tvvv\n  line\n    entity\ttt2\n  line\n    entity\n      tt3\n      entity_names\n        entity_name\ttt1\n        entity_name\ttt2\n      validators\n        validator\tjjj\n"
+    }
+  ]
+}

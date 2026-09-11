@@ -37,7 +37,7 @@ middle pane. When a grammar is given, an initial parse runs at startup.
 +------------------+------------------+------------------------------------+
 | Grammar - x.lark |                  |                                     |
 |   parser: earley | Input - y.txt *  | Parse tree                          |
-|                  |                  | [ Text ][ Tree ][ Corpus ] (tabs)   |
+|                  |                  | [Text][Tree][Tokens][Corpus] (tabs) |
 | +--------------+ | +--------------+ | +--------------------------------+  |
 | |              | | |              | | |                                |  |
 | | editable     | | | editable     | | | read only                      |  |
@@ -119,9 +119,9 @@ it into view (section 5.3.2). The two marks are independent tags; the error mark
 
 ### 5.3 Right - Parse tree
 
-A `ttk.Notebook` with tabs **Text**, **Tree** and **Corpus**. Text and Tree are two views of the
-same parse result and are both filled on every successful parse, so switching tabs never triggers a
-reparse. Corpus is described in section 9.
+A `ttk.Notebook` with tabs **Text**, **Tree**, **Tokens** and **Corpus**. Text and Tree are two
+views of the same parse result and are both filled on every successful parse, so switching tabs
+never triggers a reparse. Corpus is described in section 9.
 
 #### 5.3.1 Text view
 
@@ -150,11 +150,50 @@ The highlight is refused outright if the input has been edited since the parse t
 tree: the positions would point at the wrong text, so the status line says so instead. Clearing the
 selection, or any new parse, clears the highlight.
 
+#### 5.3.2.1 The other direction: input to node
+
+Moving the caret or making a selection in the input pane selects the matching node in the tree view
+and scrolls it into view. The node chosen is the **deepest** one whose span covers the caret, or
+covers the whole selection when there is one, so clicking inside a token lands on the token rather
+than on `start`.
+
+- **View > Follow Cursor in Tree** (on by default) does this on every click and key release.
+- **View > Find Node at Cursor** (`F7`) does it on demand and switches to the Tree tab first. With
+  following switched off, this is the only way in.
+
+The two directions agree: selecting a node marks its text, and putting the caret in that text
+selects the node again. Following does not fight with the span highlight, because the highlight is
+its own tag and never moves the caret.
+
+As with the forward direction, a tree built from text that has since been edited is not searched.
+Following simply does nothing; `F7` says why.
+
 To keep a runaway grammar from freezing the window, the tree view stops after 20000 nodes and adds a
 final `... truncated at 20000 nodes` row; the status line says so too. The text view is never
 truncated.
 
-#### 5.3.3 Selecting and copying
+#### 5.3.3 Tokens
+
+What the lexer produced, before the parser saw it. Many apparent grammar bugs are terminal bugs: two
+terminals matching the same text with priority deciding the winner, `%ignore` swallowing something
+needed, a regex greedier than intended. The parse tree cannot show any of that, because by then the
+decision has been made.
+
+Two tables in a vertical split:
+
+- **The token stream**: Token, Value, Line:Col, in order. Ignored tokens are listed too, greyed, so
+  you can see what `%ignore` consumed. Selecting a row highlights that token in the input pane.
+- **The terminals**: Terminal, Priority, Uses, Pattern, sorted by name. Pattern is the source form
+  where lark kept one, otherwise the compiled regex. A terminal with no uses in the current input is
+  greyed, which is how you spot a terminal that never fires.
+
+Lexing runs separately from parsing, on every parse that compiles the grammar, so the tokens are
+there **even when the input does not parse** — that is the case the view exists for. If lexing
+itself fails, the tokens read up to that point are kept and the header says where it stopped.
+
+The stream is capped at 5000 tokens, and the header says so when it truncates.
+
+#### 5.3.4 Selecting and copying
 
 - Mouse drag selects in the text view; a single click selects a row in the tree view.
 - `Ctrl+C` copies. In the text view that is the selection, or the whole pane when nothing is
@@ -182,6 +221,7 @@ before, so a pane never accumulates stale entries.
 | File  | Recent Grammars >     |                | Up to 20 remembered grammars, plus **Clear List**    |
 | File  | Save Grammar          | `Ctrl+S`       | Saves the left pane; falls back to Save As if new    |
 | File  | Save Grammar As...    |                | Saves the left pane under a chosen name              |
+| File  | Export Railroad SVG...|                | Writes the grammar as diagrams (section 10)          |
 | File  | New Input             |                | Clears the middle pane after the check               |
 | File  | Open Input...         | `Ctrl+Shift+O` | Loads a file into the middle pane, then parses       |
 | File  | Recent Inputs >       |                | Up to 20 remembered inputs, plus **Clear List**      |
@@ -195,6 +235,8 @@ before, so a pane never accumulates stale entries.
 | Parse | Parser: earley        |                | Radio, default                                       |
 | Parse | Parser: lalr          |                | Radio                                                |
 | Parse | Set Start Rule...     |                | Prompts for the start rule, default `start`          |
+| Parse | Show Ambiguity        |                | Checkbutton, off by default, earley only             |
+| Parse | Watch Imported Files  |                | Checkbutton, on by default                            |
 | Corpus| New Corpus            |                | Empties the corpus after the unsaved-changes check   |
 | Corpus| Open Corpus...        |                | Loads a corpus file and runs it                      |
 | Corpus| Save Corpus           |                | Saves the corpus; falls back to Save As if new       |
@@ -203,12 +245,17 @@ before, so a pane never accumulates stale entries.
 | Corpus| Add Input as Error Case... |           | Adds it as a case expected to fail                   |
 | Corpus| Record Expected Tree  |                | Stores the selected case's current tree              |
 | Corpus| Clear Expected Tree   |                | Drops it again, leaving a parses-or-not case         |
+| Corpus| Set Case Parser...    |                | Pins this case's parser; blank clears it             |
+| Corpus| Set Case Start Rule...|                | Pins this case's start rule; blank clears it         |
 | Corpus| Delete Case           |                | Removes the selected case                            |
 | Corpus| Run Corpus            | `F6`           | Runs every case now                                  |
 | Corpus| Run On Every Parse    |                | Checkbutton, on by default                           |
 | View  | Text View             |                | Radio, selects the Text tab                          |
 | View  | Tree View             |                | Radio, selects the Tree tab                          |
+| View  | Tokens View           |                | Radio, selects the Tokens tab                        |
 | View  | Corpus View           |                | Radio, selects the Corpus tab                        |
+| View  | Follow Cursor in Tree |                | Checkbutton, on by default                            |
+| View  | Find Node at Cursor   | `F7`           | Selects the node covering the caret, showing the tree|
 | View  | Expand All            |                | Opens every node in the tree view                    |
 | View  | Collapse All          |                | Closes every node in the tree view                   |
 | Help  | About                 |                | Application name and the installed `lark` version    |
@@ -260,6 +307,45 @@ An unsaved grammar has no directory to resolve against, so it gets neither optio
 local file then fails with a file-not-found error, and the report adds a line saying the grammar has
 not been saved, because the raw error does not make the cause obvious.
 
+#### 8.2.2 Ambiguity
+
+Earley resolves an ambiguous grammar silently, by rule priority, and hands back one tree. You never
+learn the grammar was undecided. With **Parse > Show Ambiguity (earley only)** the parser is built
+with `ambiguity='explicit'`, and every point where more than one derivation was possible comes back
+as an `_ambig` node whose children are the alternatives.
+
+In the tree view such a node reads `_ambig (2 derivations)` in orange, and its children are
+labelled `derivation 1: ...`, `derivation 2: ...`. The status line appends `2 ambiguous nodes` to
+the parse result, so an ambiguity is visible without opening the tree.
+
+This is the readable form of what LALR tells you as a shift/reduce conflict. The option is off by
+default, because most of the time you do not want the extra nodes.
+
+`lalr` rejects `ambiguity='explicit'` outright, so the option is simply not passed when lalr is
+selected. Switching it on while lalr is active says so in the status line rather than failing the
+parse.
+
+#### 8.2.3 Watching imported files
+
+An imported grammar is read once, when the grammar is compiled. Editing it in another editor would
+otherwise have no effect until the main grammar was touched, which is confusing while splitting a
+grammar across files.
+
+With **Parse > Watch Imported Files** on (the default), the imported files are polled once a second
+and any change triggers a reparse, with `Reparsed: shared.lark changed on disk` in the status line.
+
+- The list comes from `lark.load_grammar.list_grammar_imports`, so it is what lark actually resolved,
+  recursively, not a guess from reading `%import` lines.
+- Only real paths are watched. Lark's bundled grammars come back as package resources, not files,
+  and are skipped.
+- The list is rebuilt whenever the grammar text or its path changes, and only then, so a per-keystroke
+  parse does not pay for it. A grammar that does not compile keeps the previous list, since there is
+  nothing better to know.
+- A file that disappears counts as a change, so deleting an import reports itself rather than going
+  quiet.
+- Polling, not inotify: up to a second of lag, no platform-specific dependency, and nothing to leak
+  if the application exits badly.
+
 ### 8.3 Results
 
 On success the right pane shows `Tree.pretty()`, and the status line reports the number of subtree
@@ -290,7 +376,8 @@ to work?*
       "expect": "parse",
       "tree": "start\n  pair\n    a\n    value\t1"
     },
-    { "name": "missing value", "input": "a =\n", "expect": "error" }
+    { "name": "missing value", "input": "a =\n", "expect": "error" },
+    { "name": "one pair", "input": "a = 1", "expect": "parse", "start": "pair", "parser": "lalr" }
   ]
 }
 ```
@@ -300,8 +387,10 @@ to work?*
 - `expect` is `parse` or `error`. Anything else is read as `parse`.
 - `tree` is optional and only meaningful for `expect: parse`. When present it is the recorded
   `pretty()` output, compared exactly after trailing newlines are stripped.
+- `parser` and `start` are optional overrides, described in section 9.7. Absent means "use whatever
+  the application is set to". An unrecognised `parser`, or a blank `start`, reads as absent.
 
-Only those four keys are written. A case's last result is deliberately not persisted: it describes a
+Only those keys are written, and only when set. A case's last result is deliberately not persisted: it describes a
 run, not the case.
 
 A file that is missing, unreadable, not valid JSON, or has no `cases` list is reported as an error
@@ -336,9 +425,29 @@ pane itself does not parse. `F6` runs it on demand regardless of the setting.
 If the grammar does not compile, no case is run and the tab says so rather than reporting failures
 that are really one grammar error.
 
-### 9.5 The Corpus tab
+### 9.5 Per-case parser and start rule
 
-A row per case: **Case**, **Expect**, **Result**, **Detail**. Passing rows are green, failing rows
+A case can pin the parser or the start rule it runs under, through **Corpus > Set Case Parser...**
+and **Corpus > Set Case Start Rule...**. Leaving either dialog blank clears the override.
+
+Two things this makes possible:
+
+- **Fragments.** `a = 1` is not a whole document but it is a valid `pair`. A case with
+  `start: pair` tests that rule directly, without wrapping it in enough context to satisfy `start`.
+- **Parser-specific expectations.** A case can assert that an input parses under `earley` while
+  another asserts the grammar is still LALR-clean, in the same run.
+
+The parser is compiled once per distinct (parser, start rule) combination in the run and reused, so
+a corpus of fifty cases sharing three combinations compiles three parsers, not fifty.
+
+If a combination does not compile — usually a start rule that is not a rule — only the cases asking
+for it fail, with `grammar does not compile with parser=lalr start=nosuchrule` in Detail. The rest
+of the corpus still runs.
+
+### 9.6 The Corpus tab
+
+A row per case: **Case**, **Expect**, **Parser**, **Start**, **Result**, **Detail**. Parser and
+Start are blank for a case that inherits the current settings. Passing rows are green, failing rows
 red. `Detail` carries the first line of the parse error, or `tree differs from the recorded one`, or
 `parsed, but an error was expected`.
 
@@ -352,7 +461,7 @@ rather than overwriting whatever was loaded before.
 Selecting a row is required by Record Expected Tree, Clear Expected Tree and Delete Case; without a
 selection they say so in the status line and do nothing.
 
-### 9.6 In the status line
+### 9.7 In the status line
 
 When the corpus has run, its summary appears on the right of the status line, separately from the
 parse outcome on the left:
@@ -364,7 +473,56 @@ Parsed OK - 12 nodes in 3 ms                        corpus: 3/4 passed
 It is red when any case failed. It is cleared as soon as a parse runs without the corpus, so it
 never shows a stale result.
 
-## 10. Settings and recent files
+## 10. Railroad diagrams
+
+**File > Export Railroad SVG...** writes the whole grammar as one SVG document: a diagram per rule
+and per terminal, in source order, with the name above each.
+
+This is documentation output, not a view. Nothing is drawn inside the application, the diagrams do
+not follow edits, and there is no viewer: the file is meant to be opened in a browser, printed, or
+dropped into teaching material.
+
+### 10.1 How it works
+
+`lark_railroad.py` is a standalone module with no dependency on the application or on tkinter, so it
+can be used on its own:
+
+```python
+from lark_railroad import grammar_svg
+open("grammar.svg", "w").write(grammar_svg(open("grammar.lark").read()))
+```
+
+The grammar is parsed with lark's own `lark.lark` grammar rather than by reading the text, so the
+structure is whatever lark says it is. That tree is mapped onto five shapes — `Leaf`, `Skip`,
+`Sequence`, `Choice`, `Repeat` — each of which reports a width and how far it reaches above and
+below the line running through it. Sizes are gathered bottom up, positions handed down, and the
+result is emitted as SVG paths.
+
+| Grammar          | Diagram                                          |
+|------------------|--------------------------------------------------|
+| `a b c`          | a sequence, left to right                        |
+| `a \| b \| c`     | a choice: first alternative on the line, rest below |
+| `a?`, `[a]`      | a choice between `a` and an empty path           |
+| `a+`             | `a` with a loop back underneath                  |
+| `a*`             | the same loop, with an empty bypass              |
+| `a~2..4`         | a loop labelled `2 to 4`                         |
+| rule reference   | a blue rectangle                                 |
+| terminal or literal | a green rounded box                           |
+
+Rules and terminals are drawn differently on purpose: a reader needs to tell "go and look at another
+rule" from "match this text".
+
+### 10.2 Limits
+
+- Aliases (`-> name`) do not change the shape and are not drawn.
+- Template usage renders as a single box, `tmpl{...}`, rather than being expanded.
+- Terminal regexes are drawn as one box containing the pattern, not diagrammed themselves.
+- Labels longer than 40 characters are cut with an ellipsis.
+- A grammar that does not parse cannot be drawn, and the error says so. Note that this is lark's own
+  grammar parser, so a grammar can be drawable while still being a broken grammar — an undefined
+  rule reference draws fine.
+
+## 11. Settings and recent files
 
 Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sorted keys.
 
@@ -375,8 +533,11 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | `parser`          | `earley` or `lalr`                                  | `earley`   |
 | `start_rule`      | The start rule name                                 | `start`    |
 | `auto_parse`      | Parse While Typing                                  | `true`     |
-| `result_view`     | `text`, `tree` or `corpus`                          | `text`     |
+| `result_view`     | `text`, `tree`, `tokens` or `corpus`                | `text`     |
 | `run_corpus_on_parse` | Run On Every Parse                              | `true`     |
+| `watch_imports`   | Watch Imported Files                                | `true`     |
+| `follow_cursor`   | Follow Cursor in Tree                               | `true`     |
+| `show_ambiguity`  | Show Ambiguity                                      | `false`    |
 | `recent_grammar`  | Up to 20 absolute paths, most recent first          | `[]`       |
 | `recent_input`    | Up to 20 absolute paths, most recent first          | `[]`       |
 
@@ -395,16 +556,18 @@ Rules that keep the behaviour predictable:
 - Layout restore is best effort. Sash positions are reapplied 120 ms after startup and are skipped
   if they no longer fit the window.
 
-## 11. Structure of `lark-ide.py`
+## 12. Structure of the code
 
 | Object        | Responsibility                                                              |
 |---------------|-----------------------------------------------------------------------------|
 | `Settings`    | Loading, saving and validating `settings.json`, including the recent lists   |
 | `CorpusCase`  | One case: name, input, expectation, optional recorded tree, last result      |
 | `Corpus`      | The case list, its file, dirty tracking, and the default path for a grammar  |
-| `run_corpus`  | Runs every case against a compiled parser and records the outcomes           |
+| `run_corpus`  | Runs every case against the parser its supplier returns, recording outcomes  |
+| `single_parser` | A supplier that gives every case the same parser, for the simple case      |
 | `node_span`   | The line/column range a tree node or token covers, or None                   |
 | `CorpusView`  | The Corpus tab                                                              |
+| `TokenView`   | The Tokens tab: the token stream and the terminal table                     |
 | `GrammarHighlighter` | Regex based colouring of the grammar pane                            |
 | `EditorPane`  | Header, editable scrolled text, dirty tracking, open/save/new, error marking |
 | `ResultPane`  | The Text/Tree notebook, tree building, copy/select-all, context menu         |
@@ -413,7 +576,15 @@ Rules that keep the behaviour predictable:
 | `parse_args`  | Command line                                                                 |
 | `main`        | Builds the window, applies the command line, runs the main loop               |
 
-## 12. Code style, tests and the Makefile
+`lark_railroad.py` is separate and standalone:
+
+| Object          | Responsibility                                                            |
+|-----------------|---------------------------------------------------------------------------|
+| `Item` and subclasses | `Leaf`, `Skip`, `Sequence`, `Choice`, `Repeat`: sizing and drawing   |
+| `grammar_items` | Parses a grammar with `lark.lark` and maps each rule onto items            |
+| `grammar_svg`   | The whole grammar as one SVG document                                     |
+
+## 13. Code style, tests and the Makefile
 
 4-space indent, 120-character lines, formatted and checked with
 `ruff format --line-length 120` and `ruff check --line-length 120`.
@@ -439,13 +610,12 @@ The `Makefile` is the entry point:
 so the suite works over ssh. It always runs with a throwaway `HOME`, so a test run can never touch a
 real `~/.lark-ide/`.
 
-## 13. Not in this version
+## 14. Not in this version
 
 Deliberately left out for now, listed here so the spec stays honest about its boundaries:
 
-- Terminal/token view, `ambiguity='explicit'` forest display, railroad diagrams.
+- Stepping through alternative derivations side by side, rather than as nested tree rows.
+- Drawing railroad diagrams inside the application; export only.
+- Diagramming terminal regexes rather than showing them as a box.
 - A recent-corpora list; only grammars and inputs are remembered.
-- The reverse of the span highlight: selecting text in the input to find its tree node.
-- Watching imported grammar files and reparsing when one changes on disk.
-- Running a case under a start rule of its own, or with a per-case parser choice.
 - Re-recording every stale tree in one command after an intended grammar change.
