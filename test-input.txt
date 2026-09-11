@@ -1,0 +1,15 @@
+A: f1 T: t1 { V: v1 }
+A: f2
+A: f3
+A: f4(f2, f3)
+
+V: v2
+V: v3
+V: v4
+V: v5
+
+E: tt1 { A: vvv , }
+E: tt2
+E: tt3(tt1,tt2) {
+    V: jjj
+}
