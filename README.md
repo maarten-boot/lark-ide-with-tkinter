@@ -5,6 +5,8 @@
 - The app allows for exporting [railroad diagrams](./test.svg) as svg file.
 - loading and saving syntax and language to test.
 
+a example [screenshot](./lark-ide-example.png)
+
 ## Claude
 
 Haiku-ish.
@@ -13,6 +15,9 @@ Haiku-ish.
     by claude
     an app like the other.
 
-See the lark-ide.md for the full spec.
+The goal is not to modify the code but
+to specicy the build goals
+explicitly and clearly
+for the tool to build it.
 
-a example [screenshot](./lark-ide-example.png)
+See the lark-ide.md for the full spec.
