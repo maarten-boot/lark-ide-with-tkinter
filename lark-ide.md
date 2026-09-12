@@ -112,6 +112,13 @@ Alternatives are tried in that order, so a `/regexp/` inside a comment stays com
 highlighter is a lexical approximation for colouring only; it is not the grammar parser, and it is
 never consulted when deciding whether a grammar is valid.
 
+Tags are addressed as `line.column`, never as `1.0 + Nc`. Tk resolves a character offset by counting
+from the start of the widget, so tagging every match that way costs time proportional to matches
+times length: a 3000-line grammar took seventeen seconds per keystroke pause, a 7500-line one took
+two minutes. Line and column are resolved directly, which keeps the whole-pane recolour roughly
+linear and in the low hundreds of milliseconds at those sizes. A test pins the scaling, because a
+correctness test cannot see this class of mistake.
+
 ### 5.2 Middle - Input
 
 Editable. Undo/redo enabled. Holds the text to be parsed. Default file extension `.txt`; the file
@@ -246,7 +253,7 @@ stale entries.
 | Parse | Parser: earley        |                | Radio, default                                       |
 | Parse | Parser: lalr          |                | Radio                                                |
 | Parse | Set Start Rule...     |                | Prompts for the start rule, default `start`          |
-| Parse | Show Ambiguity        |                | Checkbutton, off by default, earley only             |
+| Parse | Show Ambiguity (earley only) |          | Checkbutton, off by default                          |
 | Parse | Watch Imported Files  |                | Checkbutton, on by default                            |
 | Corpus| New Corpus            |                | Empties the corpus after the unsaved-changes check   |
 | Corpus| Open Corpus...        |                | Loads a corpus file and runs it                      |
@@ -404,7 +411,7 @@ to work?*
 - `expect` is `parse` or `error`. Anything else is read as `parse`.
 - `tree` is optional and only meaningful for `expect: parse`. When present it is the recorded
   `pretty()` output, compared exactly after trailing newlines are stripped.
-- `parser` and `start` are optional overrides, described in section 9.7. Absent means "use whatever
+- `parser` and `start` are optional overrides, described in section 9.5. Absent means "use whatever
   the application is set to". An unrecognised `parser`, or a blank `start`, reads as absent.
 
 Only those keys are written, and only when set. A case's last result is deliberately not persisted: it describes a
@@ -546,7 +553,7 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | Key               | Meaning                                             | Default    |
 |-------------------|-----------------------------------------------------|------------|
 | `geometry`        | Window geometry string from the last quit           | `1400x850` |
-| `sash_fractions`  | The two dividers as proportions of the window width | `[0.33, 0.67]` |
+| `sash_fractions`  | The two dividers as proportions of the window width | equal thirds |
 | `parser`          | `earley` or `lalr`                                  | `earley`   |
 | `start_rule`      | The start rule name                                 | `start`    |
 | `auto_parse`      | Parse While Typing                                  | `true`     |

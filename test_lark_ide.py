@@ -254,6 +254,70 @@ class TestHighlighting(IdeTestCase):
         self.app.update()
         self.assertEqual(self.tags_present(), {"comment"})
 
+    def tag_per_character(self) -> list[str | None]:
+        """Which tag covers each character, read back out of the widget."""
+        text = self.app.grammar_pane.text
+        content = self.app.grammar_pane.content()
+        covered: list[str | None] = [None] * len(content)
+        for name in ide.SYNTAX_COLOURS:
+            ranges = text.tag_ranges(name)
+            for start, end in zip(ranges[0::2], ranges[1::2]):
+                # count() returns None, not (0,), for an empty range such as the very start
+                first = (text.count("1.0", start, "chars") or (0,))[0]
+                last = (text.count("1.0", end, "chars") or (0,))[0]
+                for offset in range(first, last):
+                    covered[offset] = name
+        return covered
+
+    @staticmethod
+    def expected_per_character(content: str) -> list[str | None]:
+        expected: list[str | None] = [None] * len(content)
+        for match in ide.SYNTAX_PATTERN.finditer(content):
+            if match.lastgroup:
+                for offset in range(match.start(), match.end()):
+                    expected[offset] = match.lastgroup
+        return expected
+
+    def test_every_character_gets_the_tag_the_regex_gave_it(self) -> None:
+        """Guards the offset-to-index mapping: a wrong line or column shifts tags off their text."""
+        grammar = (
+            '// a comment\nstart: pair+\npair: NAME "=" (value)\nvalue: NUMBER | /[a-z]+/i\n%import common.NUMBER\n'
+        )
+        self.app.grammar_pane.set_content(grammar)
+        self.app.highlighter.highlight()
+        self.app.update()
+        content = self.app.grammar_pane.content()
+        self.assertEqual(self.tag_per_character(), self.expected_per_character(content))
+
+    def test_tags_on_later_lines_land_on_the_right_text(self) -> None:
+        self.app.grammar_pane.set_content("\n" * 40 + "%ignore WS\n")
+        self.app.highlighter.highlight()
+        self.app.update()
+        text = self.app.grammar_pane.text
+        ranges = text.tag_ranges("directive")
+        self.assertEqual(text.get(ranges[0], ranges[1]), "%ignore")
+
+    def test_highlighting_scales_with_the_grammar(self) -> None:
+        """It used to address tags as offsets from '1.0', which Tk resolves by counting from the
+        start of the widget: O(matches x length), minutes on a few thousand lines."""
+        unit = 'rule{n}: NAME "=" /[0-9]+/  // note\n%import common.WS\n'
+        small = "".join(unit.format(n=i) for i in range(200))
+        large = "".join(unit.format(n=i) for i in range(800))
+
+        def elapsed(content: str) -> float:
+            self.app.grammar_pane.set_content(content)
+            self.app.update_idletasks()
+            start = time.perf_counter()
+            self.app.highlighter.highlight()
+            self.app.update_idletasks()
+            return time.perf_counter() - start
+
+        first = elapsed(small)
+        fourfold = elapsed(large)
+        self.assertLess(fourfold, 3.0, "a 1600-line grammar should not take seconds to colour")
+        # Linear work would roughly quadruple; the old quadratic version rose about eighteenfold.
+        self.assertLess(fourfold, max(first, 0.01) * 8, f"{first:.3f}s then {fourfold:.3f}s looks quadratic")
+
     def test_highlighting_is_rebuilt_not_accumulated(self) -> None:
         self.app.grammar_pane.set_content("%ignore WS\n")
         self.app.highlighter.highlight()

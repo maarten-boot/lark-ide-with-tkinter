@@ -9,6 +9,7 @@ Right pane:  the resulting parse tree, or the error explaining why there is none
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import re
 import time
@@ -158,6 +159,27 @@ class Settings:
         self.data[f"recent_{kind}"] = []
 
 
+def _line_starts(content: str) -> list[int]:
+    """The character offset each line begins at, for turning offsets into Tk indices."""
+    starts = [0]
+    position = content.find("\n")
+    while position != -1:
+        starts.append(position + 1)
+        position = content.find("\n", position + 1)
+    return starts
+
+
+def _text_index(starts: list[int], offset: int) -> str:
+    """A Tk ``line.column`` index for a character offset into the widget's content.
+
+    Not ``1.0 + Nc``: Tk resolves that by counting characters from the start of the widget, so
+    tagging every match that way costs O(matches x length) and a few thousand lines take minutes.
+    Line and column are resolved directly.
+    """
+    line = bisect.bisect_right(starts, offset) - 1
+    return f"{line + 1}.{offset - starts[line]}"
+
+
 class GrammarHighlighter:
     """Regex based colouring of Lark grammar source in a text widget."""
 
@@ -170,12 +192,12 @@ class GrammarHighlighter:
         content = self.text.get("1.0", "end-1c")
         for name in SYNTAX_COLOURS:
             self.text.tag_remove(name, "1.0", "end")
+        starts = _line_starts(content)
         for match in SYNTAX_PATTERN.finditer(content):
             name = match.lastgroup
             if name is None:
                 continue
-            start = f"1.0 + {match.start()}c"
-            self.text.tag_add(name, start, f"1.0 + {match.end()}c")
+            self.text.tag_add(name, _text_index(starts, match.start()), _text_index(starts, match.end()))
 
 
 @dataclass
