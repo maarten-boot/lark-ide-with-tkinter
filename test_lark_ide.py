@@ -1592,5 +1592,203 @@ class TestRecentCorpora(IdeTestCase):
         self.assertEqual(self.app.settings.recent(ide.CORPUS_KIND), [])
 
 
+class TestCursorPosition(IdeTestCase):
+    """Both editable panes report where the caret is, so a reported error can be found by hand."""
+
+    def test_both_panes_start_at_line_one_column_one(self) -> None:
+        for pane in (self.app.grammar_pane, self.app.input_pane):
+            self.assertEqual(pane.position.cget("text"), "Ln 1, Col 1")
+
+    def test_the_label_follows_the_caret(self) -> None:
+        pane = self.app.input_pane
+        pane.set_content("a = 1\nbb = 2\nccc = 3\n")
+        pane.goto(3, 5)
+        self.app.update()
+        self.assertEqual(pane.position.cget("text"), "Ln 3, Col 5")
+
+    def test_columns_match_what_lark_reports(self) -> None:
+        """A parse error says 'line 2, column 5'; putting the caret there must agree."""
+        self.parse(text="a = 1\nb = ?\n")
+        self.assertIn("line 2, column 5", self.status())
+        self.app.input_pane.goto(2, 5)
+        self.app.update()
+        self.assertEqual(self.app.input_pane.position.cget("text"), "Ln 2, Col 5")
+        self.assertEqual(self.app.input_pane.text.get("insert"), "?")
+
+    def test_a_selection_is_counted(self) -> None:
+        pane = self.app.input_pane
+        pane.set_content("abcdef\n")
+        pane.text.tag_add("sel", "1.1", "1.4")
+        pane._refresh_position()
+        self.app.update()
+        self.assertEqual(pane.position.cget("text"), "Ln 1, Col 1  (3 selected)")
+
+    def test_typing_updates_the_label(self) -> None:
+        """Guards against a later bind() for the same event silently replacing this one."""
+        pane = self.app.input_pane
+        pane.text.focus_set()
+        for key in "hello":
+            pane.text.event_generate("<KeyPress>", keysym=key)
+            pane.text.event_generate("<KeyRelease>", keysym=key)
+        self.app.update()
+        self.assertEqual(pane.position.cget("text"), "Ln 1, Col 6")
+
+    def test_loading_puts_the_caret_at_the_top(self) -> None:
+        pane = self.app.input_pane
+        pane.set_content("a = 1\nbb = 2\nccc = 3\n")
+        self.app.update()
+        self.assertEqual(pane.text.index("insert"), "1.0")
+        self.assertEqual(pane.position.cget("text"), "Ln 1, Col 1")
+
+
+class TestLineNumbers(IdeTestCase):
+    def numbers(self, pane) -> list[str]:
+        pane._draw_gutter()
+        self.app.update_idletasks()
+        return [pane.gutter.itemcget(i, "text") for i in pane.gutter.find_all()]
+
+    def test_the_gutter_numbers_the_visible_lines(self) -> None:
+        pane = self.app.grammar_pane
+        pane.set_content("".join(f"rule{i}: NAME\n" for i in range(1, 12)))
+        self.app.update()
+        self.assertEqual(self.numbers(pane)[:4], ["1", "2", "3", "4"])
+
+    def test_the_gutter_follows_the_scroll(self) -> None:
+        pane = self.app.grammar_pane
+        pane.set_content("".join(f"rule{i}: NAME\n" for i in range(1, 300)))
+        self.app.update()
+        pane.text.yview_moveto(0.5)
+        self.app.update()
+        first = int(self.numbers(pane)[0])
+        self.assertGreater(first, 1, "the gutter should show the lines actually on screen")
+
+    def test_the_gutter_widens_for_more_digits(self) -> None:
+        pane = self.app.grammar_pane
+        pane.set_content("a\n" * 5)
+        self.app.update()
+        self.numbers(pane)
+        narrow = int(pane.gutter.cget("width"))
+        pane.set_content("a\n" * 20000)
+        self.app.update()
+        self.numbers(pane)
+        self.assertGreater(int(pane.gutter.cget("width")), narrow)
+
+    def test_the_toggle_hides_and_shows_it(self) -> None:
+        self.app.line_numbers.set(False)
+        self.app.on_line_numbers_changed()
+        self.app.update()
+        for pane in (self.app.grammar_pane, self.app.input_pane):
+            self.assertFalse(pane.gutter.winfo_ismapped())
+        self.app.line_numbers.set(True)
+        self.app.on_line_numbers_changed()
+        self.app.update()
+        self.assertTrue(self.app.grammar_pane.gutter.winfo_ismapped())
+
+    def test_the_toggle_survives_a_restart(self) -> None:
+        self.app.line_numbers.set(False)
+        self.app.on_line_numbers_changed()
+        self.app.destroy()
+        self.app = self.new_app()
+        self.assertFalse(self.app.line_numbers.get())
+
+    def test_drawing_when_hidden_does_nothing(self) -> None:
+        pane = self.app.grammar_pane
+        pane.show_line_numbers(False)
+        pane._draw_gutter()
+        self.assertEqual(pane.gutter.find_all(), ())
+
+
+class TestGrammarSearch(IdeTestCase):
+    SAMPLE = 'start: pair+\npair: NAME "=" value\nvalue: NUMBER | NAME\nvalues: value+\nNAME: /[a-z]+/\n'
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.pane = self.app.grammar_pane
+        self.pane.set_content(self.SAMPLE)
+        self.app.update()
+
+    def matched_text(self) -> list[str]:
+        return [self.pane.text.get(a, b) for a, b in self.pane.match_ranges()]
+
+    def test_only_the_grammar_pane_has_a_search_bar(self) -> None:
+        self.assertTrue(self.pane.searchable)
+        self.assertFalse(self.app.input_pane.searchable)
+        self.assertEqual(self.app.input_pane.refresh_search(), 0)
+
+    def test_searching_marks_every_occurrence(self) -> None:
+        self.pane.set_search("NAME")
+        self.app.update()
+        self.assertEqual(self.matched_text(), ["NAME"] * 3)
+        self.assertEqual(self.pane.search_count.cget("text"), "3 matches")
+
+    def test_matching_is_whole_word(self) -> None:
+        """'value' must not light up inside 'values', or the highlight is noise."""
+        self.pane.set_search("value")
+        self.app.update()
+        self.assertEqual(len(self.matched_text()), 3)
+        self.assertTrue(all(text == "value" for text in self.matched_text()))
+
+    def test_one_match_is_singular(self) -> None:
+        self.pane.set_search("values")
+        self.app.update()
+        self.assertEqual(self.pane.search_count.cget("text"), "1 match")
+
+    def test_a_non_identifier_falls_back_to_a_plain_search(self) -> None:
+        self.pane.set_search('"="')
+        self.app.update()
+        self.assertEqual(self.matched_text(), ['"="'])
+
+    def test_selecting_an_identifier_becomes_the_search(self) -> None:
+        self.pane.text.tag_add("sel", "2.0", "2.4")
+        self.pane._on_selection()
+        self.app.update()
+        self.assertEqual(self.pane.search_term.get(), "pair")
+        self.assertEqual(len(self.matched_text()), 2)
+
+    def test_selecting_something_that_is_not_a_word_is_ignored(self) -> None:
+        self.pane.set_search("NAME")
+        self.pane.text.tag_add("sel", "1.0", "3.0")
+        self.pane._on_selection()
+        self.app.update()
+        self.assertEqual(self.pane.search_term.get(), "NAME")
+
+    def test_clearing_removes_every_mark(self) -> None:
+        self.pane.set_search("NAME")
+        self.pane.clear_search()
+        self.app.update()
+        self.assertEqual(self.matched_text(), [])
+        self.assertEqual(self.pane.search_count.cget("text"), "")
+
+    def test_find_next_walks_the_matches_and_wraps(self) -> None:
+        self.pane.set_search("NAME")
+        self.app.update()
+        self.pane.text.mark_set("insert", "1.0")
+        seen = []
+        for _ in range(4):
+            self.pane.find_next()
+            seen.append(self.pane.text.index("insert"))
+        self.assertEqual(len(set(seen)), 3, f"three matches, cycled: {seen}")
+        self.assertEqual(seen[0], seen[3], "it should wrap back to the first")
+
+    def test_find_next_with_no_matches(self) -> None:
+        self.pane.set_search("nosuchrule")
+        self.app.update()
+        self.assertFalse(self.pane.find_next())
+
+    def test_marks_survive_syntax_highlighting(self) -> None:
+        """The highlighter clears its own tags; it must not clear the search marks."""
+        self.pane.set_search("NAME")
+        self.app.highlighter.highlight()
+        self.app.update()
+        self.assertEqual(len(self.matched_text()), 3)
+
+    def test_marks_are_refreshed_after_an_edit(self) -> None:
+        self.pane.set_search("NAME")
+        self.pane.text.insert("1.0", "NAME NAME\n")
+        self.app._run_highlight()
+        self.app.update()
+        self.assertEqual(len(self.matched_text()), 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

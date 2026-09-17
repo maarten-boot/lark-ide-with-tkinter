@@ -42,8 +42,9 @@ nothing else. `--no-restore` starts with both panes empty.
 | File   Edit   Parse   Help                                     (menu bar) |
 +------------------+------------------+------------------------------------+
 | Grammar - x.lark |                  |                                     |
-|   parser: earley | Input - y.txt *  | Parse tree                          |
-|                  |                  | [Text][Tree][Tokens][Corpus] (tabs) |
+| parser: earley   | Input - y.txt *  | Parse tree                          |
+|      Ln 4, Col 12|      Ln 1, Col 1 | [Text][Tree][Tokens][Corpus] (tabs) |
+| Find: [ value  ] |                  |                                     |
 | +--------------+ | +--------------+ | +--------------------------------+  |
 | |              | | |              | | |                                |  |
 | | editable     | | | editable     | | | read only                      |  |
@@ -71,6 +72,19 @@ The grammar pane's header also carries a right-aligned badge with the settings t
 use, `parser: earley   start: start`. It sits above the grammar because that is what those settings
 apply to, and it updates the moment the parser or start rule changes.
 
+Both editable panes show the caret position at the right of their header, `Ln 4, Col 12`, with
+`  (12 selected)` appended while text is selected. The numbering is 1-based in both axes, matching
+the way lark reports a failure: a `Parse error at line 2, column 5` names the position the label
+shows when the caret is on the offending character.
+
+### 4.1.1 Line numbers
+
+**View > Line Numbers** (on by default, remembered) puts a numbered gutter beside both editable
+panes. It is a canvas drawn from the widget's own view: only the lines actually on screen are
+numbered, redrawn when the text scrolls, changes or is resized, and it widens as the line count
+gains digits. Scroll position comes from chaining the text widget's `yscrollcommand`, so it cannot
+drift out of step with the text.
+
 ### 4.2 Status line
 
 One line at the bottom, separated from the panes by a horizontal rule.
@@ -91,7 +105,24 @@ One line at the bottom, separated from the panes by a horizontal rule.
 ### 5.1 Left - Grammar
 
 Editable. Undo/redo enabled. Holds Lark grammar text. Default file extension `.lark`; the file
-dialog offers `*.lark` and `*.*`.
+dialog offers `*.lark` and `*.*`. Loading a file leaves the caret at the top of the pane.
+
+#### 5.1.1 Find
+
+A search box sits above the grammar, and only there: it exists to answer "where else is this rule
+used?", which is a question about a grammar rather than about a sample of the language.
+
+- Typing a term marks every occurrence in yellow and reports the count beside the box.
+- **Selecting an identifier in the grammar fills the box and marks every other use of it.** A
+  double click selects a word, so double clicking `value` lights up every `value`.
+- Matching is whole-word when the term is an identifier, so `value` does not light up inside
+  `values`. Any other term, such as `"="`, is matched literally.
+- `Return` in the box moves the caret to the next match, wrapping at the end. `Escape` clears.
+- Marks are refreshed on the same 150 ms beat as the syntax colouring, so they follow edits.
+
+The marks are a tag of their own, so syntax colouring, error marks and search marks coexist rather
+than overwriting one another. A term is matched against the raw text, which means an occurrence
+inside a comment or a string literal is marked too.
 
 The grammar is syntax highlighted. Colouring is recomputed over the whole pane 150 ms after the last
 keystroke, and immediately after a file is loaded. The token classes follow
@@ -275,6 +306,7 @@ stale entries.
 | View  | Corpus View           |                | Radio, selects the Corpus tab                        |
 | View  | Follow Cursor in Tree |                | Checkbutton, on by default                            |
 | View  | Find Node at Cursor   | `F7`           | Selects the node covering the caret, showing the tree|
+| View  | Line Numbers          |                | Checkbutton, on by default, both editable panes      |
 | View  | Reset Layout          |                | Three equal columns again                            |
 | View  | Expand All            |                | Opens every node in the tree view                    |
 | View  | Collapse All          |                | Closes every node in the tree view                   |
@@ -562,6 +594,7 @@ Settings live in `~/.lark-ide/settings.json`, written as indented JSON with sort
 | `watch_imports`   | Watch Imported Files                                | `true`     |
 | `follow_cursor`   | Follow Cursor in Tree                               | `true`     |
 | `show_ambiguity`  | Show Ambiguity                                      | `false`    |
+| `line_numbers`    | Line Numbers                                        | `true`     |
 | `recent_grammar`  | Up to 20 absolute paths, most recent first          | `[]`       |
 | `recent_input`    | Up to 20 absolute paths, most recent first          | `[]`       |
 | `recent_corpus`   | Up to 20 absolute paths, most recent first          | `[]`       |

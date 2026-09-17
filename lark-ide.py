@@ -49,6 +49,11 @@ DEFAULT_START_RULE = "start"
 ERROR_TAG = "error"
 SPAN_TAG = "span"
 SPAN_COLOUR = "#cfe3ff"
+MATCH_TAG = "match"
+MATCH_COLOUR = "#ffe9a3"
+GUTTER_COLOUR = "#999999"
+GUTTER_PAD = 10
+IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 ERROR_COLOUR = "#b00020"
 OK_COLOUR = "#1b5e20"
 HIGHLIGHT_COLOUR = "#ffd6d6"
@@ -365,8 +370,13 @@ class EditorPane(ttk.Frame):
         default_extension: str,
         editor_font: tkfont.Font,
         on_change: Callable[[], None],
+        searchable: bool = False,
     ) -> None:
         super().__init__(master)
+        self.editor_font = editor_font
+        self.searchable = searchable
+        self.line_numbers = False
+        self._gutter_pending = False
         self.base_title = title
         self.filetypes = filetypes
         self.default_extension = default_extension
@@ -378,22 +388,40 @@ class EditorPane(ttk.Frame):
         header.pack(fill="x")
         self.header = ttk.Label(header, anchor="w", padding=(4, 3))
         self.header.pack(side="left", fill="x", expand=True)
+        self.position = ttk.Label(header, anchor="e", padding=(4, 3))
+        self.position.pack(side="right")
         self.badge = ttk.Label(header, anchor="e", padding=(4, 3))
         self.badge.pack(side="right")
 
-        self.text = ScrolledText(self, wrap="none", undo=True, font=editor_font, width=40, height=25)
-        self.text.pack(fill="both", expand=True)
+        if searchable:
+            self._build_search_bar()
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+        self.gutter = tk.Canvas(body, width=40, highlightthickness=0, takefocus=0, borderwidth=0)
+        self.text = ScrolledText(body, wrap="none", undo=True, font=editor_font, width=20, height=25)
+        self.text.pack(side="right", fill="both", expand=True)
 
         hbar = ttk.Scrollbar(self, orient="horizontal", command=self.text.xview)
         hbar.pack(fill="x")
-        self.text.configure(xscrollcommand=hbar.set)
+        self.text.configure(xscrollcommand=hbar.set, yscrollcommand=self._on_yscroll)
+        self.text.bind("<Configure>", lambda _event: self._schedule_gutter())
         self.text.tag_configure(ERROR_TAG, background=HIGHLIGHT_COLOUR)
         self.text.tag_configure(SPAN_TAG, background=SPAN_COLOUR)
+        self.text.tag_configure(MATCH_TAG, background=MATCH_COLOUR)
         self.text.tag_lower(SPAN_TAG, ERROR_TAG)
 
         self.text.bind("<<Modified>>", self._on_modified)
+        # add="+" throughout: a plain bind() replaces the previous handler for that sequence, and
+        # the application binds the same events on the input pane to follow the caret in the tree.
+        self.text.bind("<KeyRelease>", self._refresh_position, add="+")
+        self.text.bind("<ButtonRelease-1>", self._refresh_position, add="+")
+        if searchable:
+            self.text.bind("<<Selection>>", self._on_selection, add="+")
         self._build_context_menu()
         self._refresh_header()
+        self._refresh_position()
+        self.show_line_numbers(True)
 
     # -- context menu ----------------------------------------------------------------------------
 
@@ -448,12 +476,157 @@ class EditorPane(ttk.Frame):
         self.text.delete("1.0", "end")
         self.text.insert("1.0", value)
         self.text.edit_reset()
+        self.text.mark_set("insert", "1.0")  # inserting leaves the caret at the end; start at the top
+        self.text.see("1.0")
         self.mark_clean()
+        self._refresh_position()
+        self._schedule_gutter()
 
     def mark_clean(self) -> None:
         self.dirty = False
         self.text.edit_modified(False)
         self._refresh_header()
+
+    # -- cursor position -------------------------------------------------------------------------
+
+    def cursor_label(self) -> str:
+        line, column = self.cursor_position()
+        selected = self.selection_size()
+        suffix = f"  ({selected} selected)" if selected else ""
+        return f"Ln {line}, Col {column}{suffix}"
+
+    def selection_size(self) -> int:
+        try:
+            return len(self.text.get("sel.first", "sel.last"))
+        except tk.TclError:
+            return 0
+
+    def _refresh_position(self, _event: tk.Event | None = None) -> None:
+        self.position.configure(text=self.cursor_label())
+
+    def goto(self, line: int, column: int = 1) -> None:
+        """Put the caret at a 1-based line and column, as lark reports them in errors."""
+        index = f"{line}.{max(column - 1, 0)}"
+        self.text.mark_set("insert", index)
+        self.text.see(index)
+        self.text.focus_set()
+        self._refresh_position()
+
+    # -- line numbers ----------------------------------------------------------------------------
+
+    def show_line_numbers(self, visible: bool) -> None:
+        if visible == self.line_numbers:
+            return
+        self.line_numbers = visible
+        if visible:
+            self.gutter.pack(side="left", fill="y", before=self.text)
+            self._schedule_gutter()
+        else:
+            self.gutter.delete("all")
+            self.gutter.pack_forget()
+
+    def _on_yscroll(self, first: str, last: str) -> None:
+        self.text.vbar.set(first, last)
+        self._schedule_gutter()
+
+    def _schedule_gutter(self) -> None:
+        if self.line_numbers and not self._gutter_pending:
+            self._gutter_pending = True
+            self.after_idle(self._draw_gutter)
+
+    def _draw_gutter(self) -> None:
+        """Draw the number of each line currently on screen, beside the line itself."""
+        self._gutter_pending = False
+        self.gutter.delete("all")
+        if not self.line_numbers:
+            return
+        total = int(self.text.index("end-1c").split(".")[0])
+        digits = max(len(str(total)), 3)
+        width = self.editor_font.measure("0") * digits + GUTTER_PAD
+        if int(self.gutter.cget("width")) != width:
+            self.gutter.configure(width=width)
+        index = self.text.index("@0,0")
+        while True:
+            info = self.text.dlineinfo(index)
+            if info is None:
+                break
+            self.gutter.create_text(
+                width - GUTTER_PAD // 2,
+                info[1],
+                anchor="ne",
+                text=index.split(".")[0],
+                font=self.editor_font,
+                fill=GUTTER_COLOUR,
+            )
+            index = self.text.index(f"{index}+1line")
+
+    # -- search ----------------------------------------------------------------------------------
+
+    def _build_search_bar(self) -> None:
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(bar, text="Find:").pack(side="left")
+        self.search_term = tk.StringVar()
+        self.search_entry = ttk.Entry(bar, textvariable=self.search_term)
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.search_count = ttk.Label(bar, anchor="e", width=12)
+        self.search_count.pack(side="right")
+        self.search_entry.bind("<Return>", lambda _event: self.find_next())
+        self.search_entry.bind("<Escape>", lambda _event: self.clear_search())
+        self.search_term.trace_add("write", lambda *_args: self.refresh_search())
+
+    def set_search(self, term: str) -> None:
+        if self.searchable and term != self.search_term.get():
+            self.search_term.set(term)
+
+    def clear_search(self) -> None:
+        self.search_term.set("")
+
+    def refresh_search(self) -> int:
+        """Mark every occurrence of the search term. Returns how many there were."""
+        if not self.searchable:
+            return 0
+        self.text.tag_remove(MATCH_TAG, "1.0", "end")
+        term = self.search_term.get().strip()
+        if not term:
+            self.search_count.configure(text="")
+            return 0
+        # A whole-word match for an identifier, so searching "value" does not light up "values".
+        pattern = rf"\b{re.escape(term)}\b" if IDENTIFIER.match(term) else re.escape(term)
+        content = self.content()
+        starts = _line_starts(content)
+        count = 0
+        for match in re.finditer(pattern, content):
+            self.text.tag_add(MATCH_TAG, _text_index(starts, match.start()), _text_index(starts, match.end()))
+            count += 1
+        self.search_count.configure(text=f"{count} match" if count == 1 else f"{count} matches")
+        return count
+
+    def match_ranges(self) -> list[tuple[str, str]]:
+        ranges = self.text.tag_ranges(MATCH_TAG)
+        return [(str(a), str(b)) for a, b in zip(ranges[0::2], ranges[1::2])]
+
+    def find_next(self) -> bool:
+        """Move the caret to the next match after it, wrapping at the end."""
+        matches = self.match_ranges()
+        if not matches:
+            return False
+        insert = self.text.index("insert")
+        following = [start for start, _end in matches if self.text.compare(start, ">", insert)]
+        target = following[0] if following else matches[0][0]
+        self.text.mark_set("insert", target)
+        self.text.see(target)
+        self._refresh_position()
+        return True
+
+    def _on_selection(self, _event: tk.Event | None = None) -> None:
+        """A selected identifier becomes the search term, so every use of it lights up."""
+        try:
+            selected = self.text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        if IDENTIFIER.match(selected):
+            self.set_search(selected)
 
     def set_badge(self, text: str) -> None:
         self.badge.configure(text=text)
@@ -1070,6 +1243,7 @@ class LarkIde(tk.Tk):
         self.watch_imports = tk.BooleanVar(value=self.settings.get("watch_imports", True))
         self.follow_cursor = tk.BooleanVar(value=self.settings.get("follow_cursor", True))
         self.show_ambiguity = tk.BooleanVar(value=self.settings.get("show_ambiguity", False))
+        self.line_numbers = tk.BooleanVar(value=self.settings.get("line_numbers", True))
         self.corpus = Corpus()
         self._corpus_summary = ""
         self._last_parse_succeeded = False
@@ -1088,6 +1262,7 @@ class LarkIde(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_quit)
         self.result_pane.select_view(self.result_view.get())
         self.refresh_corpus_view("no cases")
+        self.on_line_numbers_changed()
         self._restore_job = self.after(120, self._restore_sashes)
         self._watch_job = self.after(WATCH_INTERVAL_MS, self._watch_tick)
         self._refresh_parser_badge()
@@ -1100,7 +1275,13 @@ class LarkIde(tk.Tk):
         self.panes.pack(fill="both", expand=True, padx=4, pady=(4, 0))
 
         self.grammar_pane = EditorPane(
-            self.panes, "Grammar", GRAMMAR_FILETYPES, ".lark", self.editor_font, self.on_grammar_changed
+            self.panes,
+            "Grammar",
+            GRAMMAR_FILETYPES,
+            ".lark",
+            self.editor_font,
+            self.on_grammar_changed,
+            searchable=True,
         )
         self.input_pane = EditorPane(
             self.panes, "Input", INPUT_FILETYPES, ".txt", self.editor_font, self.schedule_parse
@@ -1229,6 +1410,9 @@ class LarkIde(tk.Tk):
         )
         view_menu.add_command(label="Find Node at Cursor", accelerator="F7", command=self.find_node_at_cursor)
         view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Line Numbers", variable=self.line_numbers, command=self.on_line_numbers_changed
+        )
         view_menu.add_command(label="Reset Layout", command=self.reset_layout)
         view_menu.add_separator()
         view_menu.add_command(label="Expand All", command=self.result_pane.expand_all)
@@ -1252,8 +1436,8 @@ class LarkIde(tk.Tk):
         self.bind_all("<F5>", lambda _event: self.parse_now())
         self.bind_all("<F6>", lambda _event: self.run_corpus_now())
         self.bind_all("<F7>", lambda _event: self.find_node_at_cursor())
-        self.input_pane.text.bind("<ButtonRelease-1>", self.on_input_cursor_moved)
-        self.input_pane.text.bind("<KeyRelease>", self.on_input_cursor_moved)
+        self.input_pane.text.bind("<ButtonRelease-1>", self.on_input_cursor_moved, add="+")
+        self.input_pane.text.bind("<KeyRelease>", self.on_input_cursor_moved, add="+")
 
     # -- commands --------------------------------------------------------------------------------
 
@@ -1346,6 +1530,7 @@ class LarkIde(tk.Tk):
             return
         self.corpus.clear()
         self.refresh_corpus_view("no cases")
+        self.on_line_numbers_changed()
 
     def open_corpus(self) -> None:
         if not self.confirm_corpus_discard():
@@ -1544,6 +1729,7 @@ class LarkIde(tk.Tk):
     def _run_highlight(self) -> None:
         self._highlight_job = None
         self.highlighter.highlight()
+        self.grammar_pane.refresh_search()
 
     def on_view_selected(self) -> None:
         self.result_pane.select_view(self.result_view.get())
@@ -1900,6 +2086,13 @@ class LarkIde(tk.Tk):
         self.settings.save()
 
     # -- finding a node from the input -------------------------------------------------------------
+
+    def on_line_numbers_changed(self) -> None:
+        visible = self.line_numbers.get()
+        for pane in (self.grammar_pane, self.input_pane):
+            pane.show_line_numbers(visible)
+        self.settings.set("line_numbers", visible)
+        self.settings.save()
 
     def on_follow_cursor_changed(self) -> None:
         self.settings.set("follow_cursor", self.follow_cursor.get())
